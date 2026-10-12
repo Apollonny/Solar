@@ -19,8 +19,8 @@ the AI assistant is powered by the [OpenCode](https://opencode.ai) CLI. Everythi
 git, and the AI agent — ships inside the app, so there's nothing to install or configure beyond
 an API key.
 
-![An earlier version running a game with chat and an embedded game view](docs/screenshot.png)
-*Earlier app screenshot. [Play the demo](https://legojazz.itch.io/survival-fortress).*
+> **In development:** Solar is an active work in progress, not a stable release. Features and
+> behavior may change, and some workflows are still being completed.
 
 ## Game development guidance
 
