@@ -4,12 +4,17 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type {
   AssetPreview,
   ChatAttachment,
-  ChatModelTier,
   ChatPartUpdate,
   ChatQuestionRequest,
-  ChatToolStatus
+  ChatToolStatus,
+  ReasoningEffort,
+  SetupStatus
 } from '../../../shared/types'
-import { FileIcon, FolderIcon, PlusIcon, SearchIcon, SendIcon, SparkIcon, StopIcon, TerminalIcon, XIcon } from './Icons'
+import { REASONING_EFFORT_CHOICES, reasoningEffortsForModel } from '../../../shared/model-reasoning'
+import type { ChatConnectionState } from '../../../shared/connection-recovery'
+import solarMark from '../assets/solar-mark.png'
+import { ProductionPanel } from './ProductionPanel'
+import { DownArrowIcon, FileIcon, FolderIcon, PlusIcon, SearchIcon, SendIcon, SparkIcon, StopIcon, TerminalIcon, XIcon } from './Icons'
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -49,7 +54,7 @@ const ATTACH_EXTENSIONS = ['.txt', '.md', '.json', '.gd', '.tscn', '.cfg', '.csv
 
 // Asset uploads: archives and 2D/3D asset files too big or too binary to ride
 // the message as data URLs. They attach by disk path — on send the main
-// process copies them into the project's .genieengine/attachments/ and points
+// process copies them into the project's .solar/attachments/ and points
 // the assistant there (see saveChatUploads). Dropped/picked folders always
 // take this route. Checked against the same 512 MB cap the main process
 // enforces; folders can only be measured there, so theirs waits until send.
@@ -133,8 +138,8 @@ const NETWORK_ERROR_RE =
 
 /** Message shown in place of the raw error when a turn dies to a lost connection. */
 const DISCONNECTED_NOTICE =
-  'Disconnected — the internet connection was lost while the assistant was working. ' +
-  'Once you are back online, press Continue (or say "continue") to pick up where it left off.'
+  'Automatic reconnect is paused. Your conversation and completed work are saved. ' +
+  'Continue when the provider or server is available.'
 
 function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -148,6 +153,10 @@ function readFileAsDataUrl(file: File): Promise<string> {
 interface Props {
   projectPath: string
   opencodeAvailable: boolean
+  setup: SetupStatus | null
+  onSetupUpdated: (status: SetupStatus) => void
+  onOpenSettings: () => void
+  onOpenScene: () => void
   onAssistantDone: () => void
 }
 
@@ -155,18 +164,6 @@ const SUGGESTIONS = [
   'Make a 2D platformer with a player that moves and jumps',
   'Add a score counter to the screen',
   'Give the game a title screen with a start button'
-]
-
-/**
- * The chat model picker (persisted app-wide, like the sidebar width). Both
- * tiers continue the same conversation — the model named on each message is
- * the only thing that changes — so switching mid-chat loses nothing.
- */
-const MODEL_TIER_KEY = 'genieengine:chatModelTier'
-
-const MODEL_TIERS: { id: ChatModelTier; label: string }[] = [
-  { id: 'medium', label: 'Medium' },
-  { id: 'large', label: 'Large' }
 ]
 
 interface SlashCommand {
@@ -193,11 +190,11 @@ function slashQueryOf(input: string): string | null {
 }
 
 function toolIcon(name: string): React.JSX.Element {
-  const base = name.replace(/^genieengine_/, '')
+  const base = name.replace(/^(?:solar|genieengine)_/, '')
   if (base === 'bash') return <TerminalIcon size={11} />
-  if (base === 'glob' || base === 'grep' || base === 'list' || base === 'webfetch' || base === 'itch_search')
+  if (base === 'glob' || base === 'grep' || base === 'list' || base === 'webfetch' || base === 'itch_search' || base === 'game_guidance')
     return <SearchIcon size={11} />
-  if (base === 'read' || base === 'write' || base === 'edit' || base === 'patch') return <FileIcon size={11} />
+  if (base === 'read' || base === 'write' || base === 'edit' || base === 'patch' || base === 'skill') return <FileIcon size={11} />
   if (base === 'itch_download') return <FolderIcon size={11} />
   return <SparkIcon size={11} />
 }
@@ -209,8 +206,9 @@ function toolLabel(tool: { name: string; title?: string; agent?: string }): stri
     title = title.split('/').filter(Boolean).slice(-2).join('/')
   }
   if (title.length > 40) title = title.slice(0, 39) + '…'
-  const name = tool.name.replace(/^genieengine_/, '')
-  const label = title ? `${name} · ${title}` : name
+  const name = tool.name.replace(/^(?:solar|genieengine)_/, '')
+  const displayName = name === 'game_guidance' ? 'Game guidance' : name === 'skill' ? 'Skill' : name
+  const label = title ? `${displayName} · ${title}` : displayName
   // Subagent calls carry their agent so delegated work reads as such.
   return tool.agent ? `${tool.agent} → ${label}` : label
 }
@@ -452,23 +450,21 @@ function QuestionCard({
   )
 }
 
-export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: Props): React.JSX.Element {
+export function ChatPanel({ projectPath, opencodeAvailable, setup, onSetupUpdated, onOpenSettings, onOpenScene, onAssistantDone }: Props): React.JSX.Element {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [streaming, setStreaming] = useState(false)
-  // Which chat model answers the next message (Medium = everyday, Large =
-  // tough tasks). Applies from the next send; an in-flight turn is unaffected.
-  const [modelTier, setModelTier] = useState<ChatModelTier>(() =>
-    localStorage.getItem(MODEL_TIER_KEY) === 'large' ? 'large' : 'medium'
-  )
-  const pickModelTier = (tier: ChatModelTier): void => {
-    localStorage.setItem(MODEL_TIER_KEY, tier)
-    setModelTier(tier)
-  }
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashDismissed, setSlashDismissed] = useState(false)
   const [attachments, setAttachments] = useState<ChatAttachment[]>([])
   const [attachError, setAttachError] = useState<string | null>(null)
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(setup?.chat.effort ?? 'default')
+  const [savingReasoningEffort, setSavingReasoningEffort] = useState(false)
+  const [reasoningEffortError, setReasoningEffortError] = useState<string | null>(null)
+  const [reasoningEffortDirty, setReasoningEffortDirty] = useState(false)
+  const reasoningSaveInFlight = useRef(false)
+  const [reasoningMenuOpen, setReasoningMenuOpen] = useState(false)
+  const reasoningPickerRef = useRef<HTMLDivElement>(null)
   // OS file drag hovering the panel. Enter/leave fire for every child crossed,
   // so a depth counter decides when the drag has truly left the panel.
   const [dragActive, setDragActive] = useState(false)
@@ -478,9 +474,119 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
   // Live connectivity, driven by the browser's online/offline events. When
   // false the composer is locked and a "Disconnected" banner explains why.
   const [online, setOnline] = useState(navigator.onLine)
+  const selectedModelReady = setup?.chat.configured === true
+  const canChat = opencodeAvailable && selectedModelReady
+  const supportedReasoningEfforts = setup
+    ? reasoningEffortsForModel(
+        setup.chat.provider,
+        setup.chat.model,
+        setup.chat.reasoningEfforts === undefined
+          ? undefined
+          : {
+              id: setup.chat.model,
+              supportsImageInput: null,
+              reasoningEfforts: setup.chat.reasoningEfforts,
+              reasoningBudgetMax: setup.chat.reasoningBudgetMax,
+              reasoningMode: setup.chat.reasoningMode
+            }
+      )
+    : null
+  const reasoningChoices = [...REASONING_EFFORT_CHOICES]
+    .filter(({ value }) => supportedReasoningEfforts?.includes(value)).reverse()
+  const effectiveReasoningEffort = reasoningEffort === 'default' ||
+    reasoningChoices.some(({ value }) => value === reasoningEffort)
+    ? reasoningEffort
+    : 'default'
+  const reasoningEffortLabel = REASONING_EFFORT_CHOICES.find(({ value }) => value === effectiveReasoningEffort)?.label ?? 'Default'
+  const chatModelName = setup?.chat.model.split('/').pop() ?? ''
+  const formattedModelName = chatModelName
+    .replace(/^gpt-/i, 'GPT-')
+    .replace(/^claude-/i, 'Claude ')
+    .replace(/^gemini-/i, 'Gemini-')
+    .replace(/^grok-/i, 'Grok-')
+
+  useEffect(() => {
+    if (!reasoningMenuOpen) return
+    const onPointerDown = (event: PointerEvent): void => {
+      if (!reasoningPickerRef.current?.contains(event.target as Node)) setReasoningMenuOpen(false)
+    }
+    const onEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setReasoningMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onEscape)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onEscape)
+    }
+  }, [reasoningMenuOpen])
+
+  useEffect(() => {
+    const onShortcut = (event: KeyboardEvent): void => {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'm') {
+        if (!setup?.chat.configured || !reasoningChoices.length) return
+        event.preventDefault()
+        setReasoningMenuOpen((open) => !open)
+      }
+    }
+    window.addEventListener('keydown', onShortcut)
+    return () => window.removeEventListener('keydown', onShortcut)
+  }, [setup?.chat.configured, reasoningChoices.length])
+
+  useEffect(() => {
+    setReasoningEffort(setup?.chat.effort ?? 'default')
+    setReasoningEffortDirty(false)
+    setReasoningEffortError(null)
+    setReasoningMenuOpen(false)
+  }, [setup?.chat.provider, setup?.chat.model, setup?.chat.effort])
+
+  const persistReasoningEffort = async (effort: ReasoningEffort): Promise<void> => {
+    if (!setup || reasoningSaveInFlight.current) return
+    if (setup.chat.effort === effort) {
+      setReasoningEffortDirty(false)
+      setReasoningMenuOpen(false)
+      return
+    }
+    reasoningSaveInFlight.current = true
+    setSavingReasoningEffort(true)
+    setReasoningEffortError(null)
+    try {
+      const result = await window.api.setChatReasoningEffort(effort)
+      if (!result.ok) {
+        setReasoningEffortError(result.error)
+        setReasoningEffortDirty(true)
+        return
+      }
+      onSetupUpdated(result.data)
+      setReasoningEffort(result.data.chat.effort)
+      setReasoningEffortDirty(false)
+      setReasoningMenuOpen(false)
+    } catch (err) {
+      setReasoningEffortError(err instanceof Error ? err.message : String(err))
+      setReasoningEffortDirty(true)
+    } finally {
+      reasoningSaveInFlight.current = false
+      setSavingReasoningEffort(false)
+    }
+  }
   // True after a turn died to a lost connection — surfaces the "Back online /
   // Continue" banner once connectivity returns. Cleared by the next send.
   const [interrupted, setInterrupted] = useState(false)
+  const [connection, setConnection] = useState<ChatConnectionState | null>(null)
+  const [connectionNow, setConnectionNow] = useState(Date.now())
+  const [resumeRunId, setResumeRunId] = useState<string | null>(null)
+  useEffect(() => {
+    setConnection(null); setResumeRunId(null); setInterrupted(false)
+    return window.api.onChatConnection(state => {
+      if (state.projectPath === projectPath) setConnection(previous => state.status==='connected' && !previous ? null : state)
+    })
+  },[projectPath])
+  useEffect(() => {
+    if (!connection) return
+    if (connection.status === 'connected') { const timer=setTimeout(()=>setConnection(null),3000); return ()=>clearTimeout(timer) }
+    const timer=setInterval(()=>setConnectionNow(Date.now()),1000)
+    return ()=>clearInterval(timer)
+  },[connection])
   // ↑/↓ recall of previously sent messages: historyPos is the entry being
   // browsed (null = not browsing), draftRef holds whatever was typed before
   // browsing started so ↓ past the newest entry brings it back.
@@ -494,6 +600,17 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
   const listRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  useEffect(()=>{
+    const receive = (event: Event): void => {
+      const detail = (event as CustomEvent<{projectPath:string;request:string}>).detail
+      if(detail?.projectPath===projectPath&&typeof detail.request==='string') {
+        setInput(previous=>previous.trim()?previous+'\n'+detail.request:detail.request)
+        requestAnimationFrame(()=>textareaRef.current?.focus())
+      }
+    }
+    window.addEventListener('solar:asset-request',receive)
+    return ()=>window.removeEventListener('solar:asset-request',receive)
+  },[projectPath])
   const onDoneRef = useRef(onAssistantDone)
   // Grow the composer with its content, up to the CSS max-height (then it
   // scrolls). Keyed on `input` so every way the text changes resizes it —
@@ -578,12 +695,16 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
 
   const addFiles = async (incoming: IncomingFile[]): Promise<void> => {
     if (incoming.length === 0) return
+    if (!canChat) {
+      setAttachError('Connect the selected chat model before attaching files.')
+      return
+    }
     setAttachError(null)
     const next = [...attachments]
     for (const { file, dir } of incoming) {
       // Folders and asset files (zips, models, audio…) attach by path — only
       // their location crosses to the main process, which copies them into
-      // .genieengine/attachments/ when the message is sent.
+      // .solar/attachments/ when the message is sent.
       if (dir || isUpload(file)) {
         const path = window.api.pathForFile(file)
         if (!path) {
@@ -621,6 +742,7 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
   // drop is the only other way in — a plain <input type="file"> can't mix
   // files and folders).
   const attachFolder = async (): Promise<void> => {
+    if (!canChat) return
     const result = await window.api.chooseDirectory()
     if (!result.ok || !result.data) return
     const path = result.data
@@ -702,14 +824,16 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
     })
     const offDone = window.api.onChatDone((payload) => {
       setStreaming(false)
+      setConnection(null)
+      setResumeRunId(payload.resumeRunId ?? null)
       // However the turn ended, no question can still be waiting on it.
       setQuestion(null)
       // A turn that failed because the connection dropped (either we're
       // observably offline, or the error reads as a transport failure) is
       // resumable — remember it so the "Continue" banner appears on reconnect.
       const dropped =
-        !payload.ok && !payload.cancelled && !!payload.error && (!navigator.onLine || NETWORK_ERROR_RE.test(payload.error))
-      if (dropped) setInterrupted(true)
+        !payload.ok && !payload.cancelled && !!payload.error && (payload.recoverable ?? (!navigator.onLine || NETWORK_ERROR_RE.test(payload.error)))
+      setInterrupted(dropped)
       setMessages((msgs) => {
         const finalized = msgs.map((m) => (m.streaming ? { ...m, streaming: false } : m))
         if (payload.cancelled) {
@@ -756,11 +880,12 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
 
   const send = async (text?: string): Promise<void> => {
     const message = (text ?? input).trim()
-    if ((!message && attachments.length === 0) || streaming) return
+    if ((!message && attachments.length === 0) || streaming || !canChat || savingReasoningEffort || reasoningEffortDirty) return
     // Offline sends could only fail at the provider — the "Disconnected"
     // banner above the composer already explains why nothing goes through.
     if (!navigator.onLine) return
     setInterrupted(false)
+    setResumeRunId(null)
     const outgoing = attachments
     if (message) {
       // Record for ↑/↓ recall — in memory and on disk (kept across /clear;
@@ -781,10 +906,14 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
       { id: crypto.randomUUID(), role: 'user', content: message, attachments: outgoing }
     ])
     setStreaming(true)
-    const result = await window.api.chatSend(message, outgoing, modelTier)
-    if (!result.ok) {
+    try {
+      const result = await window.api.chatSend(message, outgoing)
+      if (!result.ok) throw new Error(result.error)
+    } catch (error) {
       setStreaming(false)
-      setMessages((msgs) => [...msgs, { id: crypto.randomUUID(), role: 'error', content: result.error }])
+      setInput(current => current || message)
+      setAttachments(current => current.length ? current : outgoing)
+      setMessages((msgs) => [...msgs, { id: crypto.randomUUID(), role: 'error', content: error instanceof Error ? error.message : 'The assistant could not connect. Your message is ready to retry.' }])
     }
   }
 
@@ -815,7 +944,11 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
       if (streaming) await window.api.chatCancel()
       // Also deletes the saved transcript (input history survives — ↑ still
       // recalls messages sent before the clear).
-      await window.api.chatNewSession()
+      const cleared = await window.api.chatNewSession()
+      if (!cleared.ok) {
+        appendNotice(`Could not clear the saved chat: ${cleared.error}`)
+        return
+      }
       redoStackRef.current = []
       setMessages([])
       setStreaming(false)
@@ -917,21 +1050,46 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
           <span>Drop files or folders to attach</span>
         </div>
       )}
+      <div className="chat-panel-head">
+        <div className="chat-panel-identity">
+          <img src={solarMark} alt="" />
+          <span>Solar Assistant</span>
+        </div>
+        <span className="chat-panel-state" aria-live="polite">
+          <span className={`chat-panel-state-dot${!opencodeAvailable || !setup || !online ? ' unavailable' : !selectedModelReady ? ' setup' : streaming ? ' working' : ''}`} />
+          {!opencodeAvailable ? 'Unavailable' : !setup ? 'Checking' : !selectedModelReady ? 'Setup needed' : !online ? 'Offline' : streaming ? 'Working' : 'Ready'}
+        </span>
+      </div>
+      {opencodeAvailable && setup && !selectedModelReady && (
+        <div className="assistant-setup-banner" role="status">
+          <span>
+            {setup.credentialStoreError
+              ? 'Solar could not read a saved AI key. Re-enter it in AI settings; the project editor remains available.'
+              : 'Connect an API provider to use Solar Assistant. You can keep working on your project without one.'}
+          </span>
+          <button className="btn btn-sm btn-ghost" onClick={onOpenSettings}>AI settings</button>
+        </div>
+      )}
+      <ProductionPanel projectPath={projectPath} setup={setup} chatBusy={streaming} onOpenSettings={onOpenSettings} onOpenScene={onOpenScene} />
       <div className="chat-body">
       <div className="chat-messages" ref={listRef}>
         {messages.length === 0 && (
           <div className="chat-empty">
             {!opencodeAvailable && (
               <div className="notice">
-                The bundled OpenCode assistant is missing. Reinstall GenieEngine, or run{' '}
+                The bundled OpenCode assistant is missing. Reinstall Solar, or run{' '}
                 <code>npm run setup</code> in development.
               </div>
             )}
-            <p className="muted">Describe what you want to build and the assistant will write the game for you.</p>
+            <div className="chat-empty-intro">
+              <span className="chat-empty-icon"><SparkIcon size={18} /></span>
+              <h2>Start creating</h2>
+              <p className="muted">Describe what you want to build and the assistant will write the game for you.</p>
+            </div>
             <div className="chat-suggestions">
               {SUGGESTIONS.map((s) => (
-                <button key={s} className="suggestion-chip" onClick={() => send(s)}>
-                  {s}
+                <button key={s} className="suggestion-chip" disabled={!online || !canChat || streaming} onClick={() => void send(s)}>
+                  <span>{s}</span><SendIcon size={12} />
                 </button>
               ))}
             </div>
@@ -994,12 +1152,15 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
       </div>
 
       <div className="chat-inputbar">
+        {online && connection && <div className={`chat-status ${connection.status==='reconnecting'?'offline':'reconnected'}`} role="status" aria-live="polite">
+          <span className="status-dot" /><span>{connection.status==='reconnecting'?'Reconnecting…':'Reconnected — continuing your work.'}{connection.status==='reconnecting' && connection.attempt ? ` Attempt ${connection.attempt}/${connection.maxAttempts}.` : ''}{connection.status==='reconnecting' && connection.nextAttemptAt ? ` Retrying in ${Math.max(0,Math.ceil((Date.parse(connection.nextAttemptAt)-connectionNow)/1000))}s.` : ''}</span>
+        </div>}
         {!online && (
           <div className="chat-status offline" role="status">
             <span className="status-dot" />
             <span>
               {streaming
-                ? 'Disconnected — waiting for the internet to come back…'
+                ? 'Reconnecting automatically — waiting for the internet…'
                 : 'Disconnected — no internet connection.'}
             </span>
           </div>
@@ -1007,10 +1168,14 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
         {online && interrupted && !streaming && (
           <div className="chat-status reconnected" role="status">
             <span className="status-dot" />
-            <span>Back online.</span>
+            <span>Automatic reconnect paused.</span>
             <button
               className="btn btn-sm btn-primary continue-btn"
-              onClick={() => void send('Continue where you left off.')}
+              onClick={() => {
+                if (!resumeRunId) { void send('Continue where you left off.'); return }
+                setStreaming(true);setInterrupted(false)
+                void window.api.productionResume(resumeRunId).then(result=>{if(!result.ok){setStreaming(false);setInterrupted(true);setMessages(previous=>[...previous,{id:crypto.randomUUID(),role:'error',content:result.error}])}}).catch(()=>{setStreaming(false);setInterrupted(true)})
+              }}
             >
               Continue
             </button>
@@ -1060,7 +1225,8 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
             ref={textareaRef}
             className="chat-textarea"
             rows={3}
-            placeholder="Build me a game where…  (/ for commands)"
+            placeholder={canChat ? 'Build me a game where…  (/ for commands)' : 'Connect a chat model to use the assistant'}
+            disabled={!canChat}
             value={input}
             onChange={(e) => {
               setInput(e.target.value)
@@ -1150,6 +1316,7 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
               <div className="attach-btns">
                 <button
                   className="attach-btn"
+                  disabled={!canChat}
                   title="Attach files, images, or .zip asset packs — or drag & drop them (folders too) into the chat"
                   onClick={() => fileInputRef.current?.click()}
                 >
@@ -1157,25 +1324,82 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
                 </button>
                 <button
                   className="attach-btn"
+                  disabled={!canChat}
                   title="Attach a folder of assets — uploaded for the assistant when you send"
                   onClick={() => void attachFolder()}
                 >
                   <FolderIcon size={13} />
                 </button>
               </div>
-              <select
-                className="model-select"
-                value={modelTier}
-                title="Which chat model answers — Medium for everyday work, Large for tough tasks that need extra juice (may cost more). The conversation continues either way."
-                aria-label="Chat model"
-                onChange={(e) => pickModelTier(e.target.value === 'large' ? 'large' : 'medium')}
-              >
-                {MODEL_TIERS.map(({ id, label }) => (
-                  <option key={id} value={id}>
-                    {label}
-                  </option>
-                ))}
-              </select>
+              {setup?.chat.configured && reasoningChoices.length > 0 && (
+                <div className="reasoning-picker" ref={reasoningPickerRef}>
+                  <button
+                    type="button"
+                    className={`reasoning-trigger${reasoningEffortDirty ? ' dirty' : ''}`}
+                    disabled={streaming || savingReasoningEffort}
+                    title="Choose reasoning effort · Ctrl+Shift+M"
+                    aria-label={`Choose reasoning effort. ${formattedModelName}, ${reasoningEffortLabel}.`}
+                    aria-haspopup="menu"
+                    aria-expanded={reasoningMenuOpen}
+                    onClick={() => setReasoningMenuOpen((open) => !open)}
+                  >
+                    <span className="reasoning-trigger-model">{formattedModelName}</span>
+                    <span className="reasoning-trigger-level">{reasoningEffortLabel}</span>
+                    {savingReasoningEffort
+                      ? <span className="reasoning-save-spinner" aria-label="Saving reasoning effort" />
+                      : <DownArrowIcon size={11} />}
+                  </button>
+                  {reasoningMenuOpen && (
+                    <div className="reasoning-menu" role="menu" aria-label="Reasoning effort">
+                      <div className="reasoning-menu-heading">Choose reasoning effort</div>
+                      <button
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={effectiveReasoningEffort === 'default'}
+                        className={`reasoning-menu-item${effectiveReasoningEffort === 'default' ? ' selected' : ''}`}
+                        disabled={savingReasoningEffort}
+                        onClick={() => {
+                          setReasoningEffort('default')
+                          setReasoningEffortDirty(setup.chat.effort !== 'default')
+                          setReasoningEffortError(null)
+                          void persistReasoningEffort('default')
+                        }}
+                      >
+                        <span>Model default</span>
+                        <span className="reasoning-menu-note">Provider setting</span>
+                        {effectiveReasoningEffort === 'default' && <span className="reasoning-menu-check">✓</span>}
+                      </button>
+                      {[...reasoningChoices].reverse().map(({ value, label }) => (
+                        <button
+                          key={value}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={effectiveReasoningEffort === value}
+                          className={`reasoning-menu-item${effectiveReasoningEffort === value ? ' selected' : ''}`}
+                          disabled={savingReasoningEffort}
+                          onClick={() => {
+                            setReasoningEffort(value)
+                            setReasoningEffortDirty(value !== setup.chat.effort)
+                            setReasoningEffortError(null)
+                            void persistReasoningEffort(value)
+                          }}
+                        >
+                          <span>{label}</span>
+                          <span className="reasoning-menu-note">
+                            {value === 'max' ? 'Maximum' : value === 'xhigh' ? 'Very high' : value === 'high' ? 'High' : value === 'medium' ? 'Balanced' : 'Fast'}
+                          </span>
+                          {effectiveReasoningEffort === value && <span className="reasoning-menu-check">✓</span>}
+                        </button>
+                      ))}
+                      {reasoningEffortError && (
+                        <div className="reasoning-save-error" role="alert" title={reasoningEffortError}>
+                          Could not save: {reasoningEffortError}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
             {streaming ? (
               <button className="send-btn stop" title="Stop" onClick={() => void window.api.chatCancel()}>
@@ -1184,8 +1408,8 @@ export function ChatPanel({ projectPath, opencodeAvailable, onAssistantDone }: P
             ) : (
               <button
                 className="send-btn"
-                title={online ? 'Send' : 'No internet connection'}
-                disabled={(!input.trim() && attachments.length === 0) || !online}
+                title={!canChat ? 'Connect the selected chat model to send' : online ? 'Send' : 'No internet connection'}
+                disabled={(!input.trim() && attachments.length === 0) || !online || !canChat || savingReasoningEffort || reasoningEffortDirty}
                 onClick={() => void send()}
               >
                 <SendIcon size={14} />

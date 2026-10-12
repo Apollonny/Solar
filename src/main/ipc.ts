@@ -1,9 +1,15 @@
 import { dialog, ipcMain } from 'electron'
-import type { ChatAttachment, ChatModelTier, GameInputEvent, GitChange, InitialState, ProjectInfo, Result, SetupRequest, StageRect } from '../shared/types'
-import { normalizeGodotPath, resolveGodot, resolveOpencode } from './services/binaries'
+import { inspectStudio } from './services/studio-readiness'
+import { listAssetLibrary, queryAssetLibrary, installAssetPack } from './services/asset-library'
+import { installLibraryAddon } from './services/asset-library-addons'
+import type { AssetQuery } from '../shared/asset-library'
+import type { ChatAttachment, GameInputEvent, GitChange, InitialState, ModelCatalogRequest, ProjectInfo, ReasoningEffort, Result, SceneEditorAction, SetupRequest, StageRect } from '../shared/types'
+import { normalizeGodotPath, resolveGodot, resolveOpencode, validateGodotBinary } from './services/binaries'
 import { scanEcs } from './services/ecs'
 import * as files from './services/files'
 import { handleGameInput, openGodotEditor, playGame, setGameLayerVisible, setStageRect, setTestMonitorRect, stopGame } from './services/game'
+import { closeSceneEditor, getSceneEditorState, openSceneEditor, sceneEditorAction, setSceneEditorBounds, setSceneEditorVisible } from './services/scene-editor'
+import { cancelProjectValidations, suspendProjectValidations } from './services/project-validation'
 import * as git from './services/git'
 import {
   appendInputHistory,
@@ -25,7 +31,14 @@ import {
   shutdownChat,
   undoChat
 } from './services/opencode'
-import { getSetupStatus, saveSetup } from './services/opencode-setup'
+import {
+  getSetupStatus,
+  listModelIds,
+  migrateLegacyOpenCodeCredentials,
+  restoreLegacyOpenCodeAuthBackup,
+  saveSetup,
+  setChatReasoningEffort
+} from './services/opencode-setup'
 import { cancelExport, revealExport, runExport } from './services/export'
 import type { ExportPlatform } from '../shared/types'
 import { createProject, openProject, projectInfoFor } from './services/projects'
@@ -40,6 +53,10 @@ import {
   setGodotPath
 } from './state'
 import { getMainWindow } from './window'
+import { approveProduction, cancelProduction, configureProduction, getProductionSettings, productionState, resumeProduction, revealProductionEvidence, sendProductionMessage } from './services/production-workflow'
+import { prepareProductionProject } from './services/production-addons'
+import { productionOwnsRuntime, startGodotGateway } from './services/godot-execution'
+import { getProductionEnabled } from './state'
 
 /**
  * Every handler is wrapped in a Result envelope so expected failures (godot
@@ -57,11 +74,23 @@ function handle(channel: string, fn: (...args: never[]) => unknown): void {
 }
 
 /** Opening/closing a project tears down anything bound to the previous one. */
-function activateProject(project: ProjectInfo | null): void {
-  stopGame()
-  shutdownChat()
-  setCurrentProject(project)
-  if (project) addRecentProject(project.path)
+let projectTransition: Promise<void> = Promise.resolve()
+function activateProject(project: ProjectInfo | null): Promise<void> {
+  const transition = projectTransition.then(async () => {
+    const resumeValidation = suspendProjectValidations()
+    try {
+      await cancelProduction()
+      shutdownChat()
+      await cancelProjectValidations()
+      await closeSceneEditor()
+      stopGame()
+      // A persistence failure must not leave a different project active than the UI received.
+      if (project) addRecentProject(project.path)
+      setCurrentProject(project)
+    } finally { resumeValidation() }
+  })
+  projectTransition = transition.catch(() => {})
+  return transition
 }
 
 export function registerIpcHandlers(): void {
@@ -90,13 +119,13 @@ export function registerIpcHandlers(): void {
 
   handle('project:create', async (parentDir: string, name: string): Promise<ProjectInfo> => {
     const project = await createProject(parentDir, name)
-    activateProject(project)
+    await activateProject(project)
     return project
   })
 
   handle('project:open', async (path: string): Promise<ProjectInfo> => {
     const project = await openProject(path)
-    activateProject(project)
+    await activateProject(project)
     return project
   })
 
@@ -107,14 +136,14 @@ export function registerIpcHandlers(): void {
     })
     if (result.canceled || !result.filePaths[0]) return null
     const project = await openProject(result.filePaths[0])
-    activateProject(project)
+    await activateProject(project)
     return project
   })
 
   handle('project:close', () => activateProject(null))
 
   // ---- Game ----------------------------------------------------------------
-  handle('game:play', () => playGame(requireProject().path))
+  handle('game:play', () => { if (productionOwnsRuntime()) throw new Error('The production workflow owns the game runtime. Stop the workflow first.'); return playGame(requireProject().path) })
   handle('game:stop', () => stopGame())
   // High-frequency fire-and-forget channels — plain listeners, no Result envelope.
   ipcMain.on('game:stageBounds', (_event, rect: StageRect) => setStageRect(rect))
@@ -124,23 +153,37 @@ export function registerIpcHandlers(): void {
   handle('game:locateGodot', async (): Promise<string | null> => {
     const result = await dialog.showOpenDialog({
       title: 'Locate the Godot application or binary',
-      defaultPath: '/Applications',
+      ...(process.platform === 'darwin' ? { defaultPath: '/Applications' } : {}),
       properties: ['openFile']
     })
     if (result.canceled || !result.filePaths[0]) return null
     const path = normalizeGodotPath(result.filePaths[0])
+    await validateGodotBinary(path)
     setGodotPath(path)
-    const resolved = await resolveGodot()
-    if (!resolved) throw new Error(`The selected file is not an executable Godot binary: ${path}`)
-    return resolved
+    return path
   })
 
+  // ---- Godot scene workspace ----------------------------------------------
+  handle('scene:open', async () => { if (getProductionEnabled()) await startGodotGateway(); return openSceneEditor(requireProject().path) })
+  handle('scene:close', () => closeSceneEditor())
+  handle('scene:state', () => getSceneEditorState())
+  handle('scene:action', (action: SceneEditorAction) => sceneEditorAction(action))
+  ipcMain.on('scene:bounds', (_event, rect: StageRect) => setSceneEditorBounds(rect))
+  ipcMain.on('scene:visible', (_event, visible: boolean) => setSceneEditorVisible(Boolean(visible)))
+
   // ---- AI chat ---------------------------------------------------------------
-  // The tier is renderer input — anything but 'large' falls back to 'medium'.
-  handle('chat:send', (message: string, attachments?: ChatAttachment[], tier?: ChatModelTier) =>
-    sendChatMessage(message, requireProject().path, attachments ?? [], tier === 'large' ? 'large' : 'medium')
+  handle('chat:send', (message: string, attachments?: ChatAttachment[]) =>
+    getProductionEnabled() ? sendProductionMessage(message, requireProject().path, attachments ?? []) : sendChatMessage(message, requireProject().path, attachments ?? [])
   )
-  handle('chat:cancel', () => cancelChat())
+  handle('chat:cancel', async () => { await cancelProduction(); cancelChat() })
+  handle('production:settings', () => getProductionSettings())
+  handle('production:configure', (enabled: boolean) => configureProduction(enabled === true))
+  handle('production:state', () => productionState())
+  handle('production:prepareProject', () => prepareProductionProject(requireProject().path))
+  handle('production:studioReadiness', (verify: unknown) => inspectStudio(requireProject().path, verify === true))
+  handle('production:resume', (runId: string) => resumeProduction(runId))
+  handle('production:approve', (runId: string, operationId: string, approved: boolean) => approveProduction(runId, operationId, approved === true))
+  handle('production:revealEvidence', (runId: string, evidenceId: string) => revealProductionEvidence(runId, evidenceId))
   // /undo & /redo: OpenCode's native session revert (conversation AND files).
   handle('chat:undo', () => undoChat(requireProject().path))
   handle('chat:redo', () => redoChat(requireProject().path))
@@ -163,7 +206,7 @@ export function registerIpcHandlers(): void {
       inputHistory: state.inputHistory,
       // A window reload mid-turn must re-surface the question the assistant
       // is blocked on, or the turn would hang with no buttons anywhere.
-      pendingQuestion: await pendingQuestion()
+      pendingQuestion: getCurrentProject()?.path === projectPath ? await pendingQuestion() : null
     }
   })
   // A save from a no-longer-active project (debounced saves race project
@@ -178,8 +221,21 @@ export function registerIpcHandlers(): void {
   handle('chat:answerQuestion', (requestID: string, answers: string[][]) => answerQuestion(requestID, answers))
   handle('chat:rejectQuestion', (requestID: string) => rejectQuestion(requestID))
   handle('chat:setupStatus', () => getSetupStatus())
+  handle('chat:setReasoningEffort', async (effort: ReasoningEffort) => {
+    await setChatReasoningEffort(effort)
+    return getSetupStatus()
+  })
   handle('chat:saveSetup', async (request: SetupRequest) => {
     await saveSetup(request)
+    return getSetupStatus()
+  })
+  handle('chat:listModelIds', (request: ModelCatalogRequest) => listModelIds(request))
+  handle('chat:migrateLegacyOpenCodeCredentials', async (providerIds: string[]) => {
+    await migrateLegacyOpenCodeCredentials(providerIds)
+    return getSetupStatus()
+  })
+  handle('chat:restoreLegacyOpenCodeAuthBackup', async (backupId: string) => {
+    await restoreLegacyOpenCodeAuthBackup(backupId)
     return getSetupStatus()
   })
 
@@ -194,9 +250,17 @@ export function registerIpcHandlers(): void {
   handle('ecs:scan', () => scanEcs(requireProject().path))
 
   // ---- Files -----------------------------------------------------------------
+  handle('assets:library', () => listAssetLibrary())
+  handle('assets:search', (query: AssetQuery) => queryAssetLibrary(query))
+  handle('assets:install', (id: string) => installAssetPack(id))
+  handle('assets:installAddon', (id: string, projectPath: string) => installLibraryAddon(id, projectPath))
+  handle('assets:importArchive', async (id: string) => {
+    const result = await dialog.showOpenDialog({ title: 'Import partner asset archive', properties: ['openFile'], filters: [{ name: 'Asset archives', extensions: ['zip', 'rar'] }] })
+    return result.canceled || !result.filePaths[0] ? null : installAssetPack(id, result.filePaths[0])
+  })
   handle('files:list', (dir: string) => files.listDir(dir))
   handle('files:openVSCode', (target?: string) => files.openInVSCode(target ?? requireProject().path))
-  handle('files:openGodotEditor', () => openGodotEditor(requireProject().path))
+  handle('files:openGodotEditor', (recoveryMode?: boolean) => openGodotEditor(requireProject().path, recoveryMode === true))
 
   // ---- Git ---------------------------------------------------------------------
   handle('git:status', () => git.status(requireProject().path))

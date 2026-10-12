@@ -1,6 +1,13 @@
-import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
-import { assetDir, credentialsStore } from './asset-store'
+import {
+  assetDir,
+  credentialsStore,
+  ensureProjectDirectory,
+  validateProjectDirectory,
+  writeAssetFile
+} from './asset-store'
+import type { CredentialUpdate } from './asset-store'
+import { normalizeApiKey } from '../../shared/provider-connection'
 
 /**
  * OpenAI image generation ("gpt-image") client: generates 2D game art
@@ -27,7 +34,10 @@ interface GptImageCredentials extends Record<string, string> {
 const store = credentialsStore<GptImageCredentials>('gptimage-credentials.json')
 
 export async function isGptImageConfigured(): Promise<boolean> {
-  return store.isConfigured()
+  const credentials = await store.load()
+  if (!credentials) return false
+  if (!normalizeApiKey(credentials.apiKey)) throw new Error('Stored OpenAI image credentials are invalid. Re-enter the key in Settings.')
+  return true
 }
 
 /**
@@ -37,9 +47,13 @@ export async function isGptImageConfigured(): Promise<boolean> {
  * no key was provided now.
  */
 export async function saveGptImageConfig(apiKey: string): Promise<void> {
-  const key = apiKey.trim()
+  const key = normalizeApiKey(apiKey)
   if (!key) return
   await store.save({ apiKey: key })
+}
+export async function prepareGptImageConfig(apiKey: string): Promise<CredentialUpdate | null> {
+  const key = normalizeApiKey(apiKey)
+  return key ? store.prepare({apiKey:key}) : null
 }
 
 export interface GenerateImageRequest {
@@ -62,6 +76,7 @@ export async function generateImageAsset(projectPath: string, request: GenerateI
   if (!creds) throw new Error('OpenAI image generation is not configured. The user can add an API key in the AI settings panel.')
   if (!request.prompt?.trim()) throw new Error('Provide a "prompt" describing the image.')
   const dir = assetDir(projectPath, request.folder, request.name)
+  await validateProjectDirectory(projectPath, dir.abs)
 
   const res = await fetch(`${BASE_URL}/images/generations`, {
     method: 'POST',
@@ -99,11 +114,11 @@ export async function generateImageAsset(projectPath: string, request: GenerateI
     throw new Error('OpenAI returned no image data.')
   }
 
-  await mkdir(dir.abs, { recursive: true })
+  const safeDir = await ensureProjectDirectory(projectPath, dir.abs)
   // basename, not a '/'-split: dir.rel comes from path.join, which uses '\'
   // on Windows — splitting on '/' would put the whole path into the name.
   const fileName = `${basename(dir.rel)}.png`
-  await writeFile(join(dir.abs, fileName), png)
+  await writeAssetFile(safeDir, fileName, png)
 
   return {
     files: [join(dir.rel, fileName)],

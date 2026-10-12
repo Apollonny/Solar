@@ -1,7 +1,7 @@
 import { exec as dugiteExec } from 'dugite'
 import { execFile } from 'node:child_process'
-import { rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { realpath, rm } from 'node:fs/promises'
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { GitChange, GitCommit, GitRemote, GitStatus } from '../../shared/types'
 import { findBinary } from './binaries'
@@ -14,7 +14,7 @@ interface GitOutput {
 }
 
 /**
- * GenieEngine bundles git via dugite, so source control works on machines with
+ * Solar bundles git via dugite, so source control works on machines with
  * no git installed. A system git is still preferred when present because it
  * carries the user's credential helpers (keychain etc.), which makes
  * push/pull to private remotes work seamlessly.
@@ -40,6 +40,8 @@ async function resolveSystemGit(): Promise<string | null> {
 }
 
 async function git(cwd: string, args: string[]): Promise<GitOutput> {
+  // User filenames containing brackets, * or :(...) must not be interpreted as Git patterns.
+  args = ['--literal-pathspecs', ...args]
   const sysGit = await resolveSystemGit()
   if (sysGit) {
     try {
@@ -88,15 +90,17 @@ export async function status(cwd: string): Promise<GitStatus> {
     return EMPTY_STATUS
   }
 
-  const { stdout } = await git(cwd, ['status', '--porcelain=v2', '--branch'])
+  const { stdout } = await git(cwd, ['status', '--porcelain=v2', '--branch', '-z'])
   const result: GitStatus = { ...EMPTY_STATUS, isRepo: true, staged: [], unstaged: [] }
 
-  const addEntry = (x: string, y: string, path: string): void => {
-    if (x !== '.') result.staged.push({ path, status: x, staged: true, untracked: false })
-    if (y !== '.') result.unstaged.push({ path, status: y, staged: false, untracked: false })
+  const addEntry = (x: string, y: string, path: string, originalPath?: string): void => {
+    if (x !== '.') result.staged.push({ path, status: x, staged: true, untracked: false, ...(x === 'R' ? { originalPath } : {}) })
+    if (y !== '.') result.unstaged.push({ path, status: y, staged: false, untracked: false, ...(y === 'R' ? { originalPath } : {}) })
   }
 
-  for (const line of stdout.split('\n')) {
+  const records = stdout.split('\0')
+  for (let i = 0; i < records.length; i++) {
+    const line = records[i]
     if (line.startsWith('# branch.head ')) {
       result.branch = line.slice('# branch.head '.length)
     } else if (line.startsWith('# branch.upstream ')) {
@@ -112,9 +116,14 @@ export async function status(cwd: string): Promise<GitStatus> {
       const fields = line.split(' ')
       addEntry(fields[1][0], fields[1][1], fields.slice(8).join(' '))
     } else if (line.startsWith('2 ')) {
-      // 2 <XY> ... <Xscore> <path>\t<origPath> — show the new path.
+      // With -z the original name is a separate NUL record. Never interpret it as an entry.
       const fields = line.split(' ')
-      addEntry(fields[1][0], fields[1][1], fields.slice(9).join(' ').split('\t')[0])
+      addEntry(fields[1][0], fields[1][1], fields.slice(9).join(' '), records[i + 1])
+      i++
+    } else if (line.startsWith('u ')) {
+      // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+      const fields = line.split(' ')
+      addEntry(fields[1][0], fields[1][1], fields.slice(10).join(' '))
     } else if (line.startsWith('? ')) {
       result.unstaged.push({ path: line.slice(2), status: '?', staged: false, untracked: true })
     }
@@ -140,10 +149,19 @@ export async function stage(cwd: string, paths: string[]): Promise<void> {
 
 export async function unstage(cwd: string, paths: string[]): Promise<void> {
   if (paths.length === 0) return
+  let hasHead = true
   try {
     await git(cwd, ['rev-parse', '--verify', 'HEAD'])
+  } catch (err) {
+    // An actual unborn branch has a valid symbolic HEAD; other failures must surface.
+    const { stdout: ref } = await git(cwd, ['symbolic-ref', '--quiet', 'HEAD'])
+    const { stdout: refs } = await git(cwd, ['for-each-ref', '--format=%(refname)'])
+    if (refs.split('\n').includes(ref.trim())) throw err
+    hasHead = false
+  }
+  if (hasHead) {
     await git(cwd, ['restore', '--staged', '--', ...paths])
-  } catch {
+  } else {
     // Unborn branch (no commits yet): restore can't resolve HEAD, so drop the
     // entries from the index instead — same effect, files become untracked.
     await git(cwd, ['rm', '--cached', '-r', '--force', '--', ...paths])
@@ -152,7 +170,24 @@ export async function unstage(cwd: string, paths: string[]): Promise<void> {
 
 export async function discard(cwd: string, change: GitChange): Promise<void> {
   if (change.untracked) {
-    await rm(join(cwd, change.path), { recursive: true, force: true })
+    const root = await realpath(cwd)
+    const target = resolve(root, change.path)
+    const rel = relative(root, target)
+    if (!rel || isAbsolute(change.path) || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`) ||
+      rel.split(/[\\/]/).some((part) => part.toLowerCase() === '.git')) {
+      throw new Error('Cannot discard a path outside the project or its Git metadata.')
+    }
+    const parent = await realpath(dirname(target))
+    const parentRel = relative(root, parent)
+    if (isAbsolute(parentRel) || parentRel === '..' || parentRel.startsWith(`..${sep}`)) {
+      throw new Error('Cannot discard files through a link outside the project.')
+    }
+    // A stale file-tree row must never delete a file that has since been staged/tracked.
+    const { stdout } = await git(cwd, ['ls-files', '--others', '--exclude-standard', '-z', '--', change.path])
+    if (!stdout) throw new Error('This path is no longer untracked. Refresh Git status before discarding it.')
+    const { stdout: tracked } = await git(cwd, ['ls-files', '--cached', '-z', '--', change.path])
+    if (tracked) throw new Error('This path contains tracked files. Refresh Git status before discarding it.')
+    await rm(target, { recursive: true, force: true })
   } else {
     await git(cwd, ['restore', '--', change.path])
   }
@@ -167,7 +202,7 @@ async function commitIdentityArgs(cwd: string): Promise<string[]> {
     // No git identity configured (typical on a fresh machine using the
     // bundled git). Fall back to a local default so committing works out of
     // the box; users can set their real identity via `git config --global`.
-    return ['-c', 'user.name=GenieEngine', '-c', 'user.email=genieengine@localhost']
+    return ['-c', 'user.name=Solar', '-c', 'user.email=solar@localhost']
   }
 }
 

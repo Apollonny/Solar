@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AspectMode, GameState, ProjectInfo } from '../../../shared/types'
-import logo from '../assets/logo.png'
+import logo from '../assets/solar-mark.png'
 import { AdvancedToggle } from './AdvancedToggle'
+import { BrandWordmark } from './BrandWordmark'
 import { DiscordButton } from './DiscordButton'
 import {
   AspectAnyIcon,
@@ -151,7 +152,7 @@ export function TitleBar({
           </button>
         )}
         <span className="brand">
-          <img src={logo} alt="" className="brand-mark-img" /> GenieEngine
+          <img src={logo} alt="" className="brand-mark-img" /> <BrandWordmark />
         </span>
         {project && (
           <>

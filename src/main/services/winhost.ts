@@ -1,16 +1,14 @@
 import type { BrowserWindow } from 'electron'
 
 /**
- * Windows in-app game embedding: keeps the Godot game window — launched with
- * `--wid <our HWND>`, which makes the engine create it borderless,
- * windowed-mode-locked and OWNED by our window — glued over the stage rect.
+ * Windows in-app Godot surfaces: both scene-editor backends create their
+ * editor HWND as a direct child of Solar. The game runner can also reparent
+ * its window into a native child container when DPI contexts match.
  * Ports the Godot editor's in-editor game view glue (embed_process and
  * friends, platform/windows/display_server_windows.cpp, Godot 4.7): find the
- * owned window by process id, SetWindowPos it over the stage, show/hide it
- * with the stage, WM_CLOSE to close, and a focus dance on detach. Owned
- * windows always float above their owner, so no cross-process SetParent (and
- * its attached-input-queue hazards) is needed; the OS routes input to the
- * game window directly.
+ * Godot window by process id, size it to the stage, show/hide it, WM_CLOSE to
+ * close, and a focus dance on detach. Child windows follow Solar through the
+ * native parent relationship; owned game windows follow native move messages.
  *
  * Implemented with koffi (runtime FFI) rather than a compiled N-API addon
  * because the Windows installer is cross-built from macOS: an MSVC-compiled
@@ -27,13 +25,21 @@ import type { BrowserWindow } from 'electron'
  */
 
 export interface WinHost {
-  /** One find-by-pid attempt; false = game window doesn't exist yet, retry. */
+  /** One find-by-pid attempt; false = Godot window doesn't exist yet, retry. */
   attach(hostHandle: Buffer, pid: number, x: number, y: number, w: number, h: number, visible: boolean): boolean
+  /** True child HWND follows the Solar window without move polling. */
+  embedAsChild(): boolean
+  /** Whether attach() found a child HWND created by Godot itself. */
+  isChildEmbedded(): boolean
+  /** Follow host movement through Electron window messages; false means use polling. */
+  trackMoves(hostWindow: BrowserWindow, onMove: () => void): boolean
   /** Screen physical pixels. */
   setFrame(x: number, y: number, w: number, h: number): void
   setVisible(visible: boolean): void
   /** Post WM_CLOSE — the clean close request (what the Godot editor sends). */
   requestClose(): void
+  /** User-initiated shortcut, sent only when this window becomes foreground. */
+  focusAndSendShortcut(keys: number[]): boolean
   detach(): void
   /** Top-left of the virtual desktop — the origin of Godot's --position space. */
   virtualScreenOrigin(): { x: number; y: number }
@@ -48,15 +54,22 @@ const SWP_NOACTIVATE = 0x0010
 const SWP_FRAMECHANGED = 0x0020
 const SWP_ASYNCWINDOWPOS = 0x4000
 const SW_HIDE = 0
+const SW_SHOW = 5
 const SW_SHOWNA = 8
 const WM_CLOSE = 0x0010
 const WS_POPUP = 0x80000000
+const WS_CHILD = 0x40000000
 const WS_VISIBLE = 0x10000000
+const WS_CLIPCHILDREN = 0x02000000
 const WS_EX_TOPMOST = 0x00000008
 const HWND_BOTTOM = 1
+const HWND_TOP = 0
 const HWND_TOPMOST = -1
 const SM_XVIRTUALSCREEN = 76
 const SM_YVIRTUALSCREEN = 77
+const WM_MOVE = 0x0003
+const WM_MOVING = 0x0216
+const WM_WINDOWPOSCHANGED = 0x0047
 
 /**
  * A native window handle as the signed integer Win32 traffics in. Electron's
@@ -74,7 +87,7 @@ export function windowHandleArg(win: BrowserWindow): string {
   return String(nativeHandleInt(win.getNativeWindowHandle()))
 }
 
-function createWinHost(): WinHost {
+export function createWinHost(): WinHost {
   // Lazy so non-Windows platforms never load the FFI runtime.
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const koffi = require('koffi') as typeof import('koffi')
@@ -88,23 +101,60 @@ function createWinHost(): WinHost {
   const GetWindowThreadProcessId = user32.func(
     'uint32_t __stdcall GetWindowThreadProcessId(intptr hwnd, _Out_ uint32_t *pid)'
   )
+  const AttachThreadInput = user32.func('int __stdcall AttachThreadInput(uint32_t from, uint32_t to, int attach)')
+  const GetFocus = user32.func('intptr __stdcall GetFocus()')
+  const SetFocus = user32.func('intptr __stdcall SetFocus(intptr hwnd)')
+  const keybd_event = user32.func('void __stdcall keybd_event(uint8_t key, uint8_t scan, uint32_t flags, uintptr extraInfo)')
+  const GetCurrentThreadId = koffi.load('kernel32.dll').func('uint32_t __stdcall GetCurrentThreadId()')
   const GetWindow = user32.func('intptr __stdcall GetWindow(intptr hwnd, uint32_t cmd)')
+  const GetParent = user32.func('intptr __stdcall GetParent(intptr hwnd)')
+  const GetWindowLongPtrW = user32.func('intptr __stdcall GetWindowLongPtrW(intptr hwnd, int index)')
   const IsWindow = user32.func('int __stdcall IsWindow(intptr hwnd)')
+  const IsWindowVisible = user32.func('int __stdcall IsWindowVisible(intptr hwnd)')
   const SetWindowPos = user32.func(
     'int __stdcall SetWindowPos(intptr hwnd, intptr insertAfter, int x, int y, int w, int h, uint32_t flags)'
   )
-  const ShowWindow = user32.func('int __stdcall ShowWindow(intptr hwnd, int cmd)')
+  const pointType = koffi.struct({ x: 'int32_t', y: 'int32_t' })
+  const ScreenToClient = user32.func('__stdcall', 'ScreenToClient', 'int', [
+    'intptr', koffi.inout(koffi.pointer(pointType))
+  ])
+  const windowRectType = koffi.struct({ left: 'int32_t', top: 'int32_t', right: 'int32_t', bottom: 'int32_t' })
+  const GetWindowRect = user32.func('__stdcall', 'GetWindowRect', 'int', [
+    'intptr', koffi.out(koffi.pointer(windowRectType))
+  ])
+  // ShowWindow can wait while a foreign window thread handles its message and
+  // freeze Electron's main thread; ShowWindowAsync posts and returns.
+  const ShowWindowAsync = user32.func('int __stdcall ShowWindowAsync(intptr hwnd, int cmd)')
   const SetForegroundWindow = user32.func('int __stdcall SetForegroundWindow(intptr hwnd)')
-  const SetFocus = user32.func('intptr __stdcall SetFocus(intptr hwnd)')
+  const GetForegroundWindow = user32.func('intptr __stdcall GetForegroundWindow()')
+  const GetAsyncKeyState = user32.func('int16_t __stdcall GetAsyncKeyState(int key)')
+  const MapVirtualKeyW = user32.func('uint32_t __stdcall MapVirtualKeyW(uint32_t code, uint32_t mapType)')
   const PostMessageW = user32.func('int __stdcall PostMessageW(intptr hwnd, uint32_t msg, uintptr wparam, intptr lparam)')
   const GetSystemMetrics = user32.func('int __stdcall GetSystemMetrics(int index)')
   const CreateWindowExW = user32.func(
     'intptr __stdcall CreateWindowExW(uint32_t exStyle, const char16_t *cls, const char16_t *title, uint32_t style, int x, int y, int w, int h, intptr owner, intptr menu, intptr instance, intptr param)'
   )
   const DestroyWindow = user32.func('int __stdcall DestroyWindow(intptr hwnd)')
-
   let gameHwnd = 0
   let hostHwnd = 0
+  let childEmbedded = false
+  let childContainer = 0
+  let restoreChild: (() => void) | null = null
+  let lastFrame = { x: 0, y: 0, w: 1, h: 1 }
+  let frameInFlight: typeof lastFrame | null = null
+  let visibleWanted = true
+  let moveHooks: number[] = []
+  let trackingWindow: BrowserWindow | null = null
+
+  const stopMoveTracking = (): void => {
+    if (trackingWindow && !trackingWindow.isDestroyed()) {
+      for (const message of moveHooks) {
+        if (trackingWindow.isWindowMessageHooked(message)) trackingWindow.unhookWindowMessage(message)
+      }
+    }
+    moveHooks = []
+    trackingWindow = null
+  }
 
   // The game window handle is only usable while it identifies a live window;
   // drop it the moment it goes stale (the OS recycles HWND values).
@@ -116,18 +166,51 @@ function createWinHost(): WinHost {
   // Same SetWindowPos flags as DisplayServerWindows::embed_process: keep the
   // current z-order (owned windows already float above the owner), never
   // steal activation, and don't block on the game's thread.
-  const positionGameWindow = (x: number, y: number, w: number, h: number): void => {
-    SetWindowPos(gameHwnd, HWND_BOTTOM, x, y, Math.max(1, w), Math.max(1, h), SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+  const positionGameWindow = (x: number, y: number, w: number, h: number, raise = false): void => {
+    lastFrame = { x, y, w, h }
+    let positioned = true
+    if (childEmbedded) {
+      const point = { x, y }
+      if (!ScreenToClient(hostHwnd, point)) {
+        frameInFlight = null
+        return
+      }
+      if (childContainer) {
+        positioned = Boolean(SetWindowPos(childContainer, HWND_TOP, point.x, point.y, Math.max(1, w), Math.max(1, h),
+          (raise ? SWP_FRAMECHANGED : SWP_NOZORDER) | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
+        positioned = Boolean(SetWindowPos(gameHwnd, HWND_TOP, 0, 0, Math.max(1, w), Math.max(1, h),
+          (raise ? SWP_FRAMECHANGED : SWP_NOZORDER) | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)) && positioned
+      } else {
+        positioned = Boolean(SetWindowPos(gameHwnd, HWND_TOP, point.x, point.y, Math.max(1, w), Math.max(1, h),
+          (raise ? SWP_FRAMECHANGED : SWP_NOZORDER) | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
+      }
+    } else {
+      positioned = Boolean(SetWindowPos(gameHwnd, HWND_BOTTOM, x, y, Math.max(1, w), Math.max(1, h),
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
+    }
+    frameInFlight = positioned && !childEmbedded ? lastFrame : null
   }
 
-  // Mirrors _enum_proc_find_window_from_process_id_callback (Godot), walking
-  // top-level windows with FindWindowExW instead of an EnumWindows callback:
-  // the game's main window is the one whose process id matches AND whose
-  // owner is our host window (the engine set that owner itself because of
-  // --wid).
+  const windowMatchesFrame = (rect: { left: number; top: number; right: number; bottom: number }, frame: typeof lastFrame): boolean =>
+    rect.left === frame.x && rect.top === frame.y &&
+    rect.right - rect.left === Math.max(1, frame.w) &&
+    rect.bottom - rect.top === Math.max(1, frame.h)
+
+  // LibGodot shares Electron's process id. Search direct Engine children
+  // first so an unrelated Solar-owned popup cannot be mistaken for Godot.
+  // Owned top-level game windows still use the search below.
   const findGameWindow = (pid: number, host: number): number => {
     const pidOut = [0]
     let hwnd = 0
+    while ((hwnd = Number(FindWindowExW(host, hwnd, 'Engine', null))) !== 0) {
+      GetWindowThreadProcessId(hwnd, pidOut)
+      const style = Number(GetWindowLongPtrW(hwnd, -16)) >>> 0
+      if (pidOut[0] === pid && (style & WS_CHILD) !== 0 && Number(GetParent(hwnd)) === host) return hwnd
+    }
+
+    // Mirrors Godot's embed_process window discovery for the standalone
+    // executable fallback: top-level Godot windows are owned by --wid.
+    hwnd = 0
     while ((hwnd = Number(FindWindowExW(0, hwnd, null, null))) !== 0) {
       GetWindowThreadProcessId(hwnd, pidOut)
       if (pidOut[0] === pid && Number(GetWindow(hwnd, GW_OWNER)) === host) return hwnd
@@ -143,31 +226,196 @@ function createWinHost(): WinHost {
 
       gameHwnd = found
       hostHwnd = host
-
-      positionGameWindow(x, y, w, h)
-      // SW_SHOWNA like Godot, so showing the game never yanks activation
-      // away from whatever the user is typing into.
-      ShowWindow(gameHwnd, visible ? SW_SHOWNA : SW_HIDE)
-      if (visible) {
-        // Mirrors the p_grab_focus branch of embed_process. Allowed because
-        // our process is foreground when the user clicks Run — the OS lets
-        // the foreground process hand foreground status to another window.
-        SetForegroundWindow(gameHwnd)
-        SetFocus(gameHwnd)
+      frameInFlight = null
+      visibleWanted = visible
+      const style = Number(GetWindowLongPtrW(gameHwnd, -16)) >>> 0
+      if ((style & WS_CHILD) !== 0 && Number(GetParent(gameHwnd)) === hostHwnd) {
+        // A native child already belongs to the Solar window. Don't reparent
+        // it or wrap it in another STATIC container.
+        childEmbedded = true
+        childContainer = 0
       }
+
+      // Chromium's render HWND is another child of the Solar window. Put the
+      // native scene above it so the editor is visible inside the stage.
+      positionGameWindow(x, y, w, h, childEmbedded)
+      // This initial show happens directly after the user opens the editor.
+      // Never synchronously activate a foreign HWND from Electron's main thread.
+      ShowWindowAsync(gameHwnd, visible ? SW_SHOW : SW_HIDE)
       return true
     },
 
+    embedAsChild() {
+      if (!gameWindowAlive() || !hostHwnd || childEmbedded) return childEmbedded
+      let restoreStyle: (() => void) | null = null
+      let setParent: ((child: number, parent: number) => number) | null = null
+      let container = 0
+      let parentChanged = false
+      const cleanupFailedEmbed = (): void => {
+        if (parentChanged && gameWindowAlive()) {
+          ShowWindowAsync(gameHwnd, SW_HIDE)
+          setParent?.(gameHwnd, 0)
+        }
+        restoreStyle?.()
+        if (container) DestroyWindow(container)
+      }
+      try {
+        // SetParent across processes can reset DPI awareness when the two
+        // windows differ. Fall back to the owned-window path in that case.
+        const GetWindowDpiAwarenessContext = user32.func('intptr __stdcall GetWindowDpiAwarenessContext(intptr hwnd)')
+        const AreDpiAwarenessContextsEqual = user32.func('int __stdcall AreDpiAwarenessContextsEqual(intptr a, intptr b)')
+        if (!AreDpiAwarenessContextsEqual(GetWindowDpiAwarenessContext(gameHwnd), GetWindowDpiAwarenessContext(hostHwnd))) return false
+
+        const point = { x: lastFrame.x, y: lastFrame.y }
+        if (!ScreenToClient(hostHwnd, point)) return false
+        container = Number(CreateWindowExW(0, 'STATIC', '',
+          WS_CHILD | WS_CLIPCHILDREN | (visibleWanted ? WS_VISIBLE : 0),
+          point.x, point.y, Math.max(1, lastFrame.w), Math.max(1, lastFrame.h),
+          hostHwnd, 0, 0, 0))
+        if (!container) return false
+
+        const GetWindowLongPtrW = user32.func('intptr __stdcall GetWindowLongPtrW(intptr hwnd, int index)')
+        const SetWindowLongPtrW = user32.func('intptr __stdcall SetWindowLongPtrW(intptr hwnd, int index, intptr value)')
+        setParent = user32.func('intptr __stdcall SetParent(intptr child, intptr parent)')
+        const GetAncestor = user32.func('intptr __stdcall GetAncestor(intptr hwnd, uint32_t flags)')
+        const originalStyle = Number(GetWindowLongPtrW(gameHwnd, -16))
+        const childStyle = (originalStyle & ~WS_POPUP) | WS_CHILD
+        SetWindowLongPtrW(gameHwnd, -16, childStyle)
+        restoreStyle = () => { SetWindowLongPtrW(gameHwnd, -16, originalStyle) }
+        const appliedStyle = Number(GetWindowLongPtrW(gameHwnd, -16))
+        if ((appliedStyle & WS_CHILD) === 0 || (appliedStyle & WS_POPUP) !== 0) {
+          cleanupFailedEmbed()
+          return false
+        }
+        setParent(gameHwnd, container)
+        parentChanged = Number(GetAncestor(gameHwnd, 1)) === container
+        if (!parentChanged) {
+          cleanupFailedEmbed()
+          return false
+        }
+        restoreStyle = null
+        childEmbedded = true
+        childContainer = container
+        restoreChild = () => {
+          if (!gameWindowAlive()) return
+          ShowWindowAsync(gameHwnd, SW_HIDE)
+          setParent?.(gameHwnd, 0)
+          SetWindowLongPtrW(gameHwnd, -16, originalStyle)
+        }
+        positionGameWindow(lastFrame.x, lastFrame.y, lastFrame.w, lastFrame.h, true)
+        return true
+      } catch (err) {
+        console.warn('[solar] native child embedding unavailable:', err)
+        if (!childEmbedded) cleanupFailedEmbed()
+        return childEmbedded
+      }
+    },
+
+    isChildEmbedded() {
+      return gameWindowAlive() && childEmbedded
+    },
+
+    trackMoves(hostWindow, onMove) {
+      if (!gameWindowAlive() || !hostHwnd || hostWindow.isDestroyed()) return false
+      // A real child HWND follows Solar's movement directly.
+      if (childEmbedded) return true
+      if (nativeHandleInt(hostWindow.getNativeWindowHandle()) !== hostHwnd) return false
+      stopMoveTracking()
+      trackingWindow = hostWindow
+      try {
+        for (const message of [WM_MOVING, WM_MOVE, WM_WINDOWPOSCHANGED]) {
+          if (hostWindow.isWindowMessageHooked(message)) continue
+          hostWindow.hookWindowMessage(message, () => {
+            if (trackingWindow !== hostWindow || !gameWindowAlive()) return
+            try { onMove() } catch (err) {
+              console.warn('[solar] native window tracking callback failed:', err)
+            }
+          })
+          if (hostWindow.isWindowMessageHooked(message)) moveHooks.push(message)
+        }
+        if (moveHooks.length > 0) return true
+        trackingWindow = null
+        return false
+      } catch (err) {
+        stopMoveTracking()
+        console.warn('[solar] Electron window-message tracking unavailable:', err)
+        return false
+      }
+    },
+
     setFrame(x, y, w, h) {
-      if (gameWindowAlive()) positionGameWindow(x, y, w, h)
+      if (!gameWindowAlive()) return
+      const desired = { x, y, w: Math.max(1, w), h: Math.max(1, h) }
+      // Keep the newest requested position while the asynchronous Win32 call
+      // is in flight. The location-change hook applies it as soon as Godot
+      // confirms the previous position.
+      lastFrame = desired
+      const current = { left: 0, top: 0, right: 0, bottom: 0 }
+      const hasCurrent = Boolean(GetWindowRect(gameHwnd, current))
+
+      // SetWindowPos is asynchronous for foreign window threads. Keep one
+      // request in flight and coalesce drag updates to the latest stage rect;
+      // otherwise stale window-position messages trail behind Solar.
+      if (frameInFlight) {
+        if (!hasCurrent || windowMatchesFrame(current, frameInFlight)) frameInFlight = null
+        else return
+      }
+      if (hasCurrent && windowMatchesFrame(current, desired)) return
+      positionGameWindow(desired.x, desired.y, desired.w, desired.h)
     },
 
     setVisible(visible) {
-      if (gameWindowAlive()) ShowWindow(gameHwnd, visible ? SW_SHOWNA : SW_HIDE)
+      visibleWanted = visible
+      if (childContainer) ShowWindowAsync(childContainer, visible ? SW_SHOWNA : SW_HIDE)
+      if (gameWindowAlive()) {
+        ShowWindowAsync(gameHwnd, visible ? SW_SHOWNA : SW_HIDE)
+        if (visible && childEmbedded) {
+          SetWindowPos(childContainer || gameHwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+        }
+      }
     },
 
     requestClose() {
       if (gameWindowAlive()) PostMessageW(gameHwnd, WM_CLOSE, 0, 0)
+    },
+
+    focusAndSendShortcut(keys) {
+      if (!gameWindowAlive() || keys.length === 0) return false
+      // Avoid combining a Solar command with keys the user is already holding.
+      if ([0x10, 0x11, 0x12, 0x5b, 0x5c].some((vk) => (Number(GetAsyncKeyState(vk)) & 0x8000) !== 0)) return false
+      if (!SetForegroundWindow(hostHwnd) && Number(GetForegroundWindow()) !== hostHwnd) return false
+      if (!IsWindowVisible(gameHwnd)) return false
+
+      // Godot owns a separate Win32 input queue. Attach it temporarily so the
+      // Solar toolbar can focus the owned editor window and send real keyboard
+      // state. Posting WM_KEYDOWN directly does not update GetKeyState(); Godot
+      // then sees Ctrl+F1 as plain F1 and opens the Help dialog instead.
+      const currentThread = Number(GetCurrentThreadId())
+      const threadOut = [0]
+      const gameThread = Number(GetWindowThreadProcessId(gameHwnd, threadOut))
+      if (!gameThread) return false
+      const previousFocus = Number(GetFocus())
+      const attached = gameThread !== currentThread && Boolean(AttachThreadInput(currentThread, gameThread, 1))
+      if (gameThread !== currentThread && !attached) return false
+      try {
+        SetFocus(gameHwnd)
+        if (Number(GetFocus()) !== gameHwnd) return false
+        for (const key of keys) {
+          keybd_event(key, Number(MapVirtualKeyW(key, 0)) & 0xff, 0, 0)
+        }
+        for (const key of [...keys].reverse()) {
+          keybd_event(key, Number(MapVirtualKeyW(key, 0)) & 0xff, 0x0002, 0)
+        }
+        return true
+      } finally {
+        // Let Godot's worker-thread message pump consume both key edges before
+        // returning focus to Chromium and detaching the shared input queue.
+        setTimeout(() => {
+          if (previousFocus && IsWindow(previousFocus)) SetFocus(previousFocus)
+          if (attached) AttachThreadInput(currentThread, gameThread, 0)
+        }, 100)
+      }
     },
 
     // The temp-window dance is Godot's documented workaround (see
@@ -178,6 +426,12 @@ function createWinHost(): WinHost {
     // DefWindowProc class Godot registers — FFI can't cheaply supply a
     // WNDPROC pointer, and the window only exists for a microsecond.
     detach() {
+      stopMoveTracking()
+      restoreChild?.()
+      restoreChild = null
+      childEmbedded = false
+      if (childContainer) DestroyWindow(childContainer)
+      childContainer = 0
       if (hostHwnd) {
         const tmp = Number(CreateWindowExW(WS_EX_TOPMOST, 'STATIC', '', WS_POPUP | WS_VISIBLE, 0, 0, 1, 1, hostHwnd, 0, 0, 0))
         if (tmp) {
@@ -188,6 +442,7 @@ function createWinHost(): WinHost {
       }
       gameHwnd = 0
       hostHwnd = 0
+      frameInFlight = null
     },
 
     // Godot's --position argument is in Godot screen space, whose origin is
@@ -214,7 +469,7 @@ export function winhost(): WinHost | null {
       try {
         cached = createWinHost()
       } catch (err) {
-        console.error('[genieengine] winhost unavailable:', err)
+        console.error('[solar] winhost unavailable:', err)
         cached = null
       }
     }

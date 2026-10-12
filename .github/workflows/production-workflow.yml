@@ -1,0 +1,29 @@
+name: Production workflow contracts
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows-contracts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.401
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.12.19
+      - run: npm ci --ignore-scripts
+      - run: npm run build:orchestrator
+      - run: npm run test:production
+      - run: npm run production:execution
+      - run: npm run setup
+      - run: npm run test:execution
+      - run: npm run typecheck
+      - run: npm run build

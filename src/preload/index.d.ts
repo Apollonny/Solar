@@ -1,8 +1,8 @@
-import type { GenieEngineApi } from '../shared/types'
+import type { SolarApi } from '../shared/types'
 
 declare global {
   interface Window {
-    api: GenieEngineApi
+    api: SolarApi
   }
 }
 

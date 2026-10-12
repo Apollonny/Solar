@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { ProjectInfo } from '../../../shared/types'
-import logo from '../assets/logo.png'
+import logo from '../assets/solar-mark.png'
 import { AdvancedToggle } from './AdvancedToggle'
+import { BrandWordmark } from './BrandWordmark'
 import { DiscordButton } from './DiscordButton'
-import { FolderIcon, GearIcon, PlusIcon } from './Icons'
+import { ExternalIcon, FolderIcon, GearIcon, PlusIcon } from './Icons'
 
 interface Props {
   recents: ProjectInfo[]
@@ -29,6 +30,7 @@ export function Welcome({
   const [name, setName] = useState('My First Game')
   const [parentDir, setParentDir] = useState('')
   const [busy, setBusy] = useState(false)
+  const pending = useRef(false)
   const [error, setError] = useState<string | null>(null)
 
   const browse = async (): Promise<void> => {
@@ -36,28 +38,34 @@ export function Welcome({
     if (result.ok && result.data) setParentDir(result.data)
   }
 
-  const create = async (): Promise<void> => {
-    if (!name.trim() || !parentDir) return
+  const open = async (action: () => Promise<{ ok: true; data: ProjectInfo | null } | { ok: false; error: string }>): Promise<void> => {
+    if (pending.current) return
+    pending.current = true
     setBusy(true)
     setError(null)
-    const result = await window.api.createProject(parentDir, name)
-    setBusy(false)
-    if (result.ok) onProjectOpened(result.data)
-    else setError(result.error)
+    try {
+      const result = await action()
+      if (result.ok && result.data) onProjectOpened(result.data)
+      else if (!result.ok) setError(result.error)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      pending.current = false
+      setBusy(false)
+    }
+  }
+
+  const create = async (): Promise<void> => {
+    if (!name.trim() || !parentDir) return
+    await open(() => window.api.createProject(parentDir, name))
   }
 
   const openDialog = async (): Promise<void> => {
-    setError(null)
-    const result = await window.api.openProjectDialog()
-    if (result.ok && result.data) onProjectOpened(result.data)
-    else if (!result.ok) setError(result.error)
+    await open(() => window.api.openProjectDialog())
   }
 
   const openRecent = async (path: string): Promise<void> => {
-    setError(null)
-    const result = await window.api.openProject(path)
-    if (result.ok) onProjectOpened(result.data)
-    else setError(result.error)
+    await open(() => window.api.openProject(path))
   }
 
   const folderSlug =
@@ -68,97 +76,124 @@ export function Welcome({
       .replace(/\s+/g, '-') || 'my-game'
 
   return (
-    <div className="welcome">
-      <div className="welcome-card">
+    <div className={creating ? 'welcome is-creating' : 'welcome'}>
+      <div className="welcome-ambient" aria-hidden="true" />
+      <div className="welcome-shell">
         <div className="welcome-head">
-          <h1 className="logo">
-            <img src={logo} alt="" className="brand-mark-img big" /> GenieEngine
-          </h1>
+          <span className="welcome-brand">
+            <img src={logo} alt="" className="brand-mark-img" />
+            <BrandWordmark />
+          </span>
           <div className="welcome-head-actions">
             <AdvancedToggle value={advancedMode} onChange={onToggleAdvancedMode} />
-            <button
-              className="icon-btn"
-              title="AI settings (coding agent, 2D & 3D asset generation)"
-              onClick={onOpenSettings}
-            >
-              <GearIcon size={16} />
+            <button className="icon-btn" title="AI settings" aria-label="AI settings" onClick={onOpenSettings}>
+              <GearIcon size={17} />
             </button>
             <DiscordButton />
           </div>
         </div>
-        <p className="tagline">The AI game engine. Describe your game — watch it come to life.</p>
-
-        {!creating ? (
-          <>
-            <div className="welcome-actions">
-              <button className="btn btn-primary btn-lg" onClick={() => setCreating(true)}>
-                <PlusIcon /> New Game
-              </button>
-              <button className="btn btn-ghost btn-lg" onClick={openDialog}>
-                <FolderIcon /> Open Project
-              </button>
+        <div className="welcome-main">
+          <main className="welcome-card">
+            <div className="welcome-symbol" aria-hidden="true">
+              <img src={logo} alt="" />
             </div>
+            <h1 className="welcome-title">
+              Create worlds<br />with AI.
+            </h1>
+            <p className="tagline">
+              From first idea to playable game. Create with an AI assistant, shape it in Godot, and see every change come to life.
+            </p>
 
-            {recents.length > 0 && (
+            {!creating ? (
+              <div className="welcome-actions">
+                <button className="btn btn-primary btn-lg" disabled={busy} onClick={() => setCreating(true)}>
+                  <PlusIcon /> Create a game
+                </button>
+                <button className="btn btn-ghost btn-lg" disabled={busy} onClick={openDialog}>
+                  <FolderIcon /> Open a project
+                </button>
+              </div>
+            ) : (
+              <div className="new-form">
+                <label className="form-row">
+                  <span className="label">Game name</span>
+                  <input
+                    className="text-input"
+                    value={name}
+                    autoFocus
+                    onChange={(e) => setName(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && create()}
+                  />
+                </label>
+                <label className="form-row">
+                  <span className="label">Location</span>
+                  <div className="path-row">
+                    <input
+                      className="text-input path-input"
+                      value={parentDir}
+                      placeholder="Choose where to store your game…"
+                      onChange={(e) => setParentDir(e.target.value)}
+                    />
+                    <button className="btn btn-ghost" onClick={browse}>
+                      Browse…
+                    </button>
+                  </div>
+                </label>
+                {parentDir && (
+                  <p className="path-preview">
+                    Will create <code>{parentDir}/{folderSlug}</code> with a starter Godot project and a git repository.
+                  </p>
+                )}
+                <div className="welcome-actions">
+                  <button
+                    className="btn btn-primary btn-lg"
+                    disabled={busy || !name.trim() || !parentDir}
+                    onClick={create}
+                  >
+                    {busy ? 'Creating…' : 'Create Game'}
+                  </button>
+                  <button className="btn btn-ghost btn-lg" disabled={busy} onClick={() => setCreating(false)}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {error && <p className="welcome-error" role="alert">{error}</p>}
+          </main>
+          <aside className="welcome-side">
+            <div className="welcome-side-head">
+              <h2>Recent projects</h2>
+              <span>
+                {recents.length} {recents.length === 1 ? 'project' : 'projects'}
+              </span>
+            </div>
+            {recents.length > 0 ? (
               <div className="recents">
-                <h2 className="recents-title">Recent</h2>
                 {recents.map((r) => (
-                  <button key={r.path} className="recent-item" onClick={() => openRecent(r.path)}>
+                  <button key={r.path} className="recent-item" disabled={busy} onClick={() => openRecent(r.path)}>
                     <span className="recent-name">{r.name}</span>
                     <span className="recent-path">{r.path}</span>
+                    <span className="recent-arrow" aria-hidden="true">
+                      <ExternalIcon size={15} />
+                    </span>
                   </button>
                 ))}
               </div>
-            )}
-          </>
-        ) : (
-          <div className="new-form">
-            <label className="form-row">
-              <span className="label">Game name</span>
-              <input
-                className="text-input"
-                value={name}
-                autoFocus
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && create()}
-              />
-            </label>
-            <label className="form-row">
-              <span className="label">Location</span>
-              <div className="path-row">
-                <input
-                  className="text-input path-input"
-                  value={parentDir}
-                  placeholder="Choose where to store your game…"
-                  onChange={(e) => setParentDir(e.target.value)}
-                />
-                <button className="btn btn-ghost" onClick={browse}>
-                  Browse…
-                </button>
+            ) : (
+              <div className="welcome-empty">
+                <span className="welcome-empty-orbit" aria-hidden="true" />
+                <p>Your next world starts here.</p>
+                <span>Created and opened projects will appear in this space.</span>
               </div>
-            </label>
-            {parentDir && (
-              <p className="path-preview">
-                Will create <code>{parentDir}/{folderSlug}</code> with a starter Godot project and a
-                git repository.
-              </p>
             )}
-            <div className="welcome-actions">
-              <button
-                className="btn btn-primary btn-lg"
-                disabled={busy || !name.trim() || !parentDir}
-                onClick={create}
-              >
-                {busy ? 'Creating…' : 'Create Game'}
-              </button>
-              <button className="btn btn-ghost btn-lg" disabled={busy} onClick={() => setCreating(false)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        )}
-
-        {error && <p className="welcome-error">{error}</p>}
+            <p className="welcome-side-foot">Powered by Godot. Directed by you.</p>
+          </aside>
+        </div>
+        <div className="welcome-foot">
+          <span>Solar</span>
+          <span>CREATE WORLDS WITH AI</span>
+        </div>
       </div>
     </div>
   )

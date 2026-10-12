@@ -1,7 +1,8 @@
 import { app } from 'electron'
 import { execFile } from 'node:child_process'
-import { constants } from 'node:fs'
-import { access } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { constants, createReadStream } from 'node:fs'
+import { access, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -41,7 +42,7 @@ const EXTRA_DIRS =
 async function isExecutable(path: string): Promise<boolean> {
   try {
     await access(path, constants.X_OK)
-    return true
+    return (await stat(path)).isFile()
   } catch {
     return false
   }
@@ -75,8 +76,19 @@ export function normalizeGodotPath(path: string): string {
   return path
 }
 
+/** Validate the selected override itself; fallback resolution cannot establish its validity. */
+export async function validateGodotBinary(path: string): Promise<void> {
+  if (!(await isExecutable(path))) throw new Error('Choose an executable Godot 4 binary.')
+  try {
+    const { stdout } = await pexec(path, ['--version'], { timeout: 5000, windowsHide: true, maxBuffer: 65536 })
+    if (!/^4\.\d+\.\d+(?:[.-]|$)/.test(stdout.trim())) throw new Error('Unsupported Godot version')
+  } catch {
+    throw new Error(`The selected file is not a working Godot 4 binary: ${path}`)
+  }
+}
+
 /**
- * GenieEngine ships with its own engines (fetched by scripts/fetch-vendor.mjs).
+ * Solar ships with its own engines (fetched by scripts/fetch-vendor.mjs).
  * In development they live in <repo>/vendor; in packaged builds
  * electron-builder copies them into the app's resources directory.
  */
@@ -95,13 +107,48 @@ export function bundledGodotPath(): string {
   }
 }
 
+let embeddedGodotCheck: Promise<string | null> | null = null
+
+/** The Solar-built Godot executable creates scene and game --wid HWNDs as native children. */
+export function resolveEmbeddedGodot(): Promise<string | null> {
+  if (process.platform !== 'win32' || process.arch !== 'x64') return Promise.resolve(null)
+  if (embeddedGodotCheck) return embeddedGodotCheck
+  embeddedGodotCheck = (async () => {
+    const dir = join(vendorDir(), 'godot', 'win32')
+    const exe = join(dir, 'solar-godot.exe')
+    try {
+      const [raw, file] = await Promise.all([
+        readFile(join(dir, 'solar-godot-manifest.json'), 'utf8'),
+        stat(exe)
+      ])
+      const manifest = JSON.parse(raw) as {
+        version?: string
+        commit?: string
+        target?: string
+        architecture?: string
+        sha256?: string
+      }
+      if (!file.isFile() || manifest.version !== '4.7.1-stable' ||
+        manifest.commit !== 'a13da4feb8d8aefc283c3763d33a2f170a18d541' ||
+        manifest.target !== 'editor-executable' || manifest.architecture !== 'x86_64' ||
+        !/^[a-f0-9]{64}$/i.test(manifest.sha256 ?? '')) return null
+      const hash = createHash('sha256')
+      for await (const chunk of createReadStream(exe)) hash.update(chunk)
+      return hash.digest('hex') === manifest.sha256 ? exe : null
+    } catch {
+      return null
+    }
+  })()
+  return embeddedGodotCheck
+}
+
 export function bundledOpencodePath(): string {
   const bin = process.platform === 'win32' ? 'opencode.exe' : 'opencode'
   return join(vendorDir(), 'opencode', process.platform, bin)
 }
 
 // Resolution order: explicit user override → bundled engine → system installs.
-// The bundled engine outranks system copies so every GenieEngine install runs
+// The bundled engine outranks system copies so every Solar install runs
 // the exact Godot version the app was tested with.
 export async function resolveGodot(): Promise<string | null> {
   const settings = getSettings()

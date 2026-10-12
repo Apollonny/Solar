@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
-import type { GenieEngineApi } from '../shared/types'
+import type { SolarApi } from '../shared/types'
 
 function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   return ipcRenderer.invoke(channel, ...args) as Promise<T>
@@ -13,7 +13,22 @@ function subscribe(channel: string, cb: (...args: never[]) => void): () => void 
   return () => ipcRenderer.removeListener(channel, listener)
 }
 
-const api: GenieEngineApi = {
+const api: SolarApi = {
+  assetLibrary: () => invoke('assets:library'),
+  assetSearch: query => invoke('assets:search', query),
+  assetInstall: id => invoke('assets:install', id),
+  assetImportArchive: id => invoke('assets:importArchive', id),
+  assetInstallAddon: (id, projectPath) => invoke('assets:installAddon', id, projectPath),
+  onAssetLibraryChanged: cb => subscribe('assets:changed', cb),
+  productionSettings: () => invoke('production:settings'),
+  productionConfigure: enabled => invoke('production:configure', enabled),
+  productionState: () => invoke('production:state'),
+  productionPrepareProject: () => invoke('production:prepareProject'),
+  studioReadiness: (verifyConnections = false) => invoke('production:studioReadiness', verifyConnections),
+  productionResume: runId => invoke('production:resume', runId),
+  productionApprove: (runId, operationId, approved) => invoke('production:approve', runId, operationId, approved),
+  productionRevealEvidence: (runId, evidenceId) => invoke('production:revealEvidence', runId, evidenceId),
+  onProductionState: cb => subscribe('production:state', cb),
   platform: process.platform,
 
   getInitialState: () => invoke('app:getInitialState'),
@@ -38,7 +53,15 @@ const api: GenieEngineApi = {
   onGameTestShot: (cb) => subscribe('game:test-shot', cb),
   onGameFps: (cb) => subscribe('game:fps', cb),
 
-  chatSend: (message, attachments, tier) => invoke('chat:send', message, attachments, tier),
+  openSceneEditor: () => invoke('scene:open'),
+  closeSceneEditor: () => invoke('scene:close'),
+  getSceneEditorState: () => invoke('scene:state'),
+  sceneEditorAction: (action) => invoke('scene:action', action),
+  setSceneEditorBounds: (rect) => ipcRenderer.send('scene:bounds', rect),
+  setSceneEditorVisible: (visible) => ipcRenderer.send('scene:visible', visible),
+  onSceneEditorState: (cb) => subscribe('scene:state', cb),
+
+  chatSend: (message, attachments) => invoke('chat:send', message, attachments),
   // File objects lost their .path in modern Electron — this is the sanctioned
   // way for the renderer to learn where a dropped/picked file lives on disk
   // (asset uploads travel by path, not by value; see ChatAttachment).
@@ -59,9 +82,16 @@ const api: GenieEngineApi = {
   chatAnswerQuestion: (requestID, answers) => invoke('chat:answerQuestion', requestID, answers),
   chatRejectQuestion: (requestID) => invoke('chat:rejectQuestion', requestID),
   getSetupStatus: () => invoke('chat:setupStatus'),
+  setChatReasoningEffort: (effort) => invoke('chat:setReasoningEffort', effort),
   saveSetup: (request) => invoke('chat:saveSetup', request),
+  listModelIds: (request) => invoke('chat:listModelIds', request),
+  migrateLegacyOpenCodeCredentials: (providerIds) =>
+    invoke('chat:migrateLegacyOpenCodeCredentials', providerIds),
+  restoreLegacyOpenCodeAuthBackup: (backupId) =>
+    invoke('chat:restoreLegacyOpenCodeAuthBackup', backupId),
   onChatPart: (cb) => subscribe('chat:part', cb),
   onChatDone: (cb) => subscribe('chat:done', cb),
+  onChatConnection: (cb) => subscribe('chat:connection', cb),
   onAssetPreview: (cb) => subscribe('chat:asset-preview', cb),
   onChatFilesChanged: (cb) => subscribe('chat:files-changed', cb),
   onChatQuestion: (cb) => subscribe('chat:question', cb),
@@ -76,7 +106,8 @@ const api: GenieEngineApi = {
 
   listDir: (path) => invoke('files:list', path),
   openInVSCode: (target) => invoke('files:openVSCode', target),
-  openInGodotEditor: () => invoke('files:openGodotEditor'),
+  openInGodotEditor: (recoveryMode) => invoke('files:openGodotEditor', recoveryMode),
+  onGodotEditorFailure: (cb) => subscribe('files:godotEditorFailure', cb),
 
   gitStatus: () => invoke('git:status'),
   gitInit: () => invoke('git:init'),

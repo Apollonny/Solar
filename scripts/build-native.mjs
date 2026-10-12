@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Builds the layerhost native addon (macOS only — it hosts the embedded
- * game's CoreAnimation layer inside the GenieEngine window). Tolerant of
+ * game's CoreAnimation layer inside the Solar window). Tolerant of
  * failure so `npm install` still succeeds on machines without a compiler;
  * native embedded play mode simply reports itself unavailable then.
  */
@@ -27,5 +27,9 @@ try {
   console.log('✓ layerhost addon built')
 } catch {
   console.warn('⚠ layerhost addon build failed (Xcode Command Line Tools missing?).')
+  if (process.env.GENIEENGINE_REQUIRE_NATIVE === '1') {
+    console.error('  Release builds require the native macOS game host.')
+    process.exit(1)
+  }
   console.warn('  Native embedded play mode will be unavailable; web mode still works.')
 }

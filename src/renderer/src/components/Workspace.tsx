@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { ProjectInfo } from '../../../shared/types'
+import type { ProjectInfo, SetupStatus } from '../../../shared/types'
 import { ChatPanel } from './ChatPanel'
 import { FilesPanel } from './FilesPanel'
 import { GitPanel } from './GitPanel'
@@ -11,7 +11,12 @@ interface Props {
   project: ProjectInfo
   width: number
   opencodeAvailable: boolean
+  setup: SetupStatus | null
+  onSetupUpdated: (status: SetupStatus) => void
   advancedMode: boolean
+  onLocateGodot: () => Promise<void>
+  onOpenSettings: () => void
+  onOpenScene: () => void
 }
 
 const TABS: { id: Tab; label: string; icon: React.JSX.Element }[] = [
@@ -24,7 +29,7 @@ const TABS: { id: Tab; label: string; icon: React.JSX.Element }[] = [
  * The right-hand workspace sidebar. All three panels stay mounted (hidden via
  * CSS) so chat history, expanded folders and git state survive tab switches.
  */
-export function Workspace({ project, width, opencodeAvailable, advancedMode }: Props): React.JSX.Element {
+export function Workspace({ project, width, opencodeAvailable, setup, onSetupUpdated, advancedMode, onLocateGodot, onOpenSettings, onOpenScene }: Props): React.JSX.Element {
   const [tab, setTab] = useState<Tab>('chat')
   // Bumped when the AI finishes work or the window refocuses, so the files
   // and git panels refresh to reflect changes made outside the UI.
@@ -59,10 +64,10 @@ export function Workspace({ project, width, opencodeAvailable, advancedMode }: P
       )}
       <div className="workspace-body">
         <div className="panel" style={{ display: !advancedMode || tab === 'chat' ? 'flex' : 'none' }}>
-          <ChatPanel projectPath={project.path} opencodeAvailable={opencodeAvailable} onAssistantDone={bump} />
+          <ChatPanel projectPath={project.path} opencodeAvailable={opencodeAvailable} setup={setup} onSetupUpdated={onSetupUpdated} onOpenSettings={onOpenSettings} onOpenScene={onOpenScene} onAssistantDone={bump} />
         </div>
         <div className="panel" style={{ display: advancedMode && tab === 'files' ? 'flex' : 'none' }}>
-          <FilesPanel project={project} refreshToken={workVersion} />
+          <FilesPanel project={project} refreshToken={workVersion} onLocateGodot={onLocateGodot} onUseAsset={request=>{setTab('chat');window.dispatchEvent(new CustomEvent('solar:asset-request',{detail:{projectPath:project.path,request}}))}} />
         </div>
         <div className="panel" style={{ display: advancedMode && tab === 'git' ? 'flex' : 'none' }}>
           <GitPanel active={advancedMode && tab === 'git'} refreshToken={workVersion} />

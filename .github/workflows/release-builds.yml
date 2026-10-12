@@ -1,0 +1,75 @@
+name: Release builds
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.artifact }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            artifact: macos-arm64
+            require_native: true
+          - runner: macos-15-intel
+            artifact: macos-x64
+            require_native: true
+          - runner: windows-latest
+            artifact: windows-x64
+            require_native: false
+          - runner: ubuntu-latest
+            artifact: linux-x64
+            require_native: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        if: matrix.artifact == 'windows-x64'
+        with:
+          python-version: '3.12'
+      - name: Install dependencies and stage platform binaries
+        run: npm ci
+        env:
+          GENIEENGINE_REQUIRE_NATIVE: ${{ matrix.require_native && '1' || '0' }}
+      - name: Audit resolved dependencies
+        run: npm run audit:dependencies
+      - uses: actions/setup-dotnet@v4
+        if: matrix.artifact == 'windows-x64'
+        with:
+          dotnet-version: 10.0.401
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.artifact == 'windows-x64'
+        with:
+          version: 0.12.19
+      - name: Build self-contained Microsoft workflow and offline execution runtime
+        if: matrix.artifact == 'windows-x64'
+        run: |
+          npm run build:orchestrator
+          npm run production:execution
+      - name: Install LibGodot build tools
+        if: matrix.artifact == 'windows-x64'
+        run: python -m pip install 'scons>=4.4,<5'
+      - name: Build native Godot editor library and child-window executable
+        if: matrix.artifact == 'windows-x64'
+        run: npm run build:libgodot
+      - name: Package application
+        run: npm run dist
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Solar-${{ matrix.artifact }}
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 30

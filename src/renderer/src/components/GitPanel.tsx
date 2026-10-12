@@ -24,7 +24,7 @@ const STATUS_LABEL: Record<string, string> = {
   D: 'Deleted',
   R: 'Renamed',
   C: 'Copied',
-  U: 'Untracked',
+  U: 'Conflict',
   '?': 'Untracked'
 }
 
@@ -97,6 +97,10 @@ function splitPath(path: string): { name: string; dir: string } {
   return idx === -1 ? { name: path, dir: '' } : { name: path.slice(idx + 1), dir: path.slice(0, idx) }
 }
 
+function changePaths(change: GitChange): string[] {
+  return change.originalPath ? [change.path, change.originalPath] : [change.path]
+}
+
 /** VS Code-style source control: stage, commit, push/pull, remote setup. */
 export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
   const [status, setStatus] = useState<GitStatus | null>(null)
@@ -107,11 +111,24 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
   const infoTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const actionPending = useRef(false)
+  const refreshId = useRef(0)
+  useEffect(() => () => {
+    refreshId.current++
+    if (infoTimer.current) clearTimeout(infoTimer.current)
+  }, [])
 
   const refresh = useCallback(async (): Promise<void> => {
-    const [statusResult, logResult] = await Promise.all([window.api.gitStatus(), window.api.gitLog()])
-    if (statusResult.ok) setStatus(statusResult.data)
-    if (logResult.ok) setHistory(logResult.data)
+    const id = ++refreshId.current
+    try {
+      const [statusResult, logResult] = await Promise.all([window.api.gitStatus(), window.api.gitLog()])
+      if (id !== refreshId.current) return
+      if (statusResult.ok) setStatus(statusResult.data)
+      else setError(statusResult.error)
+      if (logResult.ok) setHistory(logResult.data)
+    } catch (err) {
+      if (id === refreshId.current) setError(err instanceof Error ? err.message : String(err))
+    }
   }, [])
 
   useEffect(() => {
@@ -133,17 +150,27 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
     name: string,
     action: () => Promise<{ ok: true; data: unknown } | { ok: false; error: string }>,
     successInfo?: (data: unknown) => string
-  ): Promise<void> => {
+  ): Promise<boolean> => {
+    if (actionPending.current) return false
+    actionPending.current = true
     setBusy(name)
     setError(null)
-    const result = await action()
-    setBusy(null)
-    if (!result.ok) {
-      setError(result.error)
-    } else if (successInfo) {
-      showInfo(successInfo(result.data))
+    try {
+      const result = await action()
+      if (!result.ok) {
+        setError(result.error)
+      } else if (successInfo) {
+        showInfo(successInfo(result.data))
+      }
+      await refresh()
+      return result.ok
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return false
+    } finally {
+      actionPending.current = false
+      setBusy(null)
     }
-    await refresh()
   }
 
   const commit = (): void => {
@@ -152,7 +179,7 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
       'commit',
       () => window.api.gitCommit(message.trim()),
       () => 'Committed.'
-    ).then(() => setMessage(''))
+    ).then((ok) => { if (ok) setMessage('') })
   }
 
   if (!status) {
@@ -161,7 +188,7 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
         <div className="panel-header">
           <span className="panel-title-caps">Source Control</span>
         </div>
-        <p className="muted pad">Loading…</p>
+        {error ? <div className="pad"><p className="error-banner" role="alert">{error}</p><button className="btn btn-ghost" onClick={() => void refresh()}>Try again</button></div> : <p className="muted pad">Loading…</p>}
       </div>
     )
   }
@@ -202,7 +229,8 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
             <button
               className="row-btn"
               title="Unstage change"
-              onClick={() => void run('unstage', () => window.api.gitUnstage([change.path]))}
+              disabled={busy !== null}
+              onClick={() => void run('unstage', () => window.api.gitUnstage(changePaths(change)))}
             >
               <MinusIcon size={12} />
             </button>
@@ -212,7 +240,8 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
               <button
                 className="row-btn"
                 title="Stage change"
-                onClick={() => void run('stage', () => window.api.gitStage([change.path]))}
+                disabled={busy !== null}
+                onClick={() => void run('stage', () => window.api.gitStage(changePaths(change)))}
               >
                 <PlusIcon size={12} />
               </button>
@@ -302,7 +331,7 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
               <button
                 className="row-btn"
                 title="Unstage all changes"
-                onClick={() => void run('unstage', () => window.api.gitUnstage(status.staged.map((c) => c.path)))}
+                onClick={() => void run('unstage', () => window.api.gitUnstage(status.staged.flatMap(changePaths)))}
               >
                 <MinusIcon size={12} />
               </button>
@@ -320,7 +349,7 @@ export function GitPanel({ active, refreshToken }: Props): React.JSX.Element {
               <button
                 className="row-btn"
                 title="Stage all changes"
-                onClick={() => void run('stage', () => window.api.gitStage(status.unstaged.map((c) => c.path)))}
+                onClick={() => void run('stage', () => window.api.gitStage(status.unstaged.flatMap(changePaths)))}
               >
                 <PlusIcon size={12} />
               </button>

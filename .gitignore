@@ -1,10 +1,18 @@
 node_modules/
 out/
 dist/
+.test-dist/
 vendor/
 native/layerhost/build/
+orchestrator/**/bin/
+orchestrator/**/obj/
 .claude/
+.impeccable/
 .DS_Store
 *.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
 
 CLAUDE.md

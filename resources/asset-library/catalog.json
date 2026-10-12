@@ -1,0 +1,368 @@
+{
+  "schemaVersion": 1,
+  "verifiedAt": "2026-09-30",
+  "authorization": "User authorized acquisition and Solar integration of these partner sources on 2026-09-30. Published license metadata is retained; purchased editions still require the publisher's download access.",
+  "packs": [
+    {
+      "id": "quaternius-animation-1",
+      "title": "Universal Animation Library",
+      "author": "Quaternius",
+      "url": "https://quaternius.itch.io/universal-animation-library",
+      "kind": "animation",
+      "dimension": "3d",
+      "style": "stylized",
+      "tags": [
+        "humanoid",
+        "rig",
+        "locomotion",
+        "walk",
+        "run",
+        "swim",
+        "combat",
+        "retarget",
+        "animation"
+      ],
+      "formats": [
+        "glb",
+        "gltf",
+        "fbx"
+      ],
+      "license": "CC0-1.0",
+      "notes": "Retarget to the character skeleton; choose root motion or in-place deliberately. Animation libraries do not supply a complete playable character.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "quaternius-animation-2",
+      "title": "Universal Animation Library 2",
+      "author": "Quaternius",
+      "url": "https://quaternius.itch.io/universal-animation-library-2",
+      "kind": "animation",
+      "dimension": "3d",
+      "style": "stylized",
+      "tags": [
+        "humanoid",
+        "parkour",
+        "combat",
+        "combo",
+        "farming",
+        "fishing",
+        "zombie",
+        "retarget",
+        "animation"
+      ],
+      "formats": [
+        "glb",
+        "gltf",
+        "fbx"
+      ],
+      "license": "CC0-1.0",
+      "notes": "Complements Library 1. Match rig naming and animation names; retarget before using combat or parkour.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "binbun-explosion-fx",
+      "title": "Explosion FX",
+      "author": "Binbun",
+      "url": "https://binbun3d.itch.io/explosion-fx",
+      "kind": "vfx",
+      "dimension": "3d",
+      "style": "stylized",
+      "tags": [
+        "explosion",
+        "particles",
+        "smoke",
+        "combat",
+        "shader",
+        "vfx"
+      ],
+      "formats": [
+        "tscn",
+        "tres",
+        "gd",
+        "gdshader"
+      ],
+      "license": "CC0-1.0",
+      "notes": "Godot 4 effects. Inspect shader/rendering requirements and namespace scripts; keep dependencies together.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "alenia-atmospheric-vfx",
+      "title": "Pixel Art Atmospheric VFX",
+      "author": "Alenia Studios",
+      "url": "https://alenia-studios.itch.io/10-pixel-art-atmospheric-vfx-pack",
+      "kind": "vfx",
+      "dimension": "2d",
+      "style": "pixel",
+      "tags": [
+        "weather",
+        "fog",
+        "rain",
+        "snow",
+        "aurora",
+        "atmosphere",
+        "spritesheet",
+        "vfx"
+      ],
+      "formats": [
+        "png"
+      ],
+      "license": "CC-BY-4.0 + publisher terms",
+      "notes": "Sprite strips use 320x180 frames, 60 frames per animation. Preserve nearest filtering and set frame count; include Alenia Studios attribution.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "quaternius-nature",
+      "title": "Stylized Nature MegaKit",
+      "author": "Quaternius",
+      "url": "https://quaternius.itch.io/stylized-nature-megakit",
+      "kind": "environment",
+      "dimension": "3d",
+      "style": "stylized",
+      "tags": [
+        "forest",
+        "tree",
+        "plant",
+        "flower",
+        "rock",
+        "grass",
+        "nature",
+        "environment"
+      ],
+      "formats": [
+        "glb",
+        "gltf",
+        "obj",
+        "fbx"
+      ],
+      "license": "CC0-1.0",
+      "notes": "Prefer glTF over FBX; include texture/material dependencies. Generate collision only for relevant solid props.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "jdsherbert-ambiences",
+      "title": "Ambiences Music Pack",
+      "author": "JDSherbert",
+      "url": "https://jdsherbert.itch.io/ambiences-music-pack",
+      "kind": "audio",
+      "dimension": "any",
+      "style": "any",
+      "tags": [
+        "ambience",
+        "music",
+        "loop",
+        "forest",
+        "desert",
+        "underwater",
+        "pub",
+        "soundtrack"
+      ],
+      "formats": [
+        "ogg",
+        "wav",
+        "mp3"
+      ],
+      "license": "Publisher license",
+      "notes": "Prefer OGG for music, WAV for short effects. Select one format per track and verify loop boundaries.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "nojoule-pixel-shaders",
+      "title": "Pixel Art Shaders",
+      "author": "Nojoule",
+      "url": "https://nojoule.itch.io/pixel-art-shaders",
+      "kind": "shader",
+      "dimension": "2d",
+      "style": "pixel",
+      "tags": [
+        "palette",
+        "dissolve",
+        "afterimage",
+        "fire",
+        "pixel",
+        "shader"
+      ],
+      "formats": [
+        "gdshader",
+        "gdshaderinc"
+      ],
+      "license": "Publisher license",
+      "notes": "Godot 4.5 source shaders. Check shader_type and renderer before assigning; include shader includes.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "creative-core-grab",
+      "title": "Godot 4 Pick Items System",
+      "author": "Creative Core Studio",
+      "url": "https://creative-core-studio.itch.io/godot-grab-system",
+      "kind": "system",
+      "dimension": "3d",
+      "style": "any",
+      "tags": [
+        "grab",
+        "pickup",
+        "interaction",
+        "physics",
+        "item",
+        "gdscript"
+      ],
+      "formats": [
+        "gd",
+        "tscn",
+        "tres"
+      ],
+      "license": "Publisher license",
+      "notes": "Adapt runtime scripts to Solar's game structure. Do not replace project.godot, autoloads or editor plugins automatically.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "ci-400-sounds",
+      "title": "400 Sounds Pack",
+      "author": "Chequered Ink",
+      "url": "https://ci.itch.io/400-sounds-pack",
+      "kind": "audio",
+      "dimension": "any",
+      "style": "any",
+      "tags": [
+        "sound",
+        "sfx",
+        "footsteps",
+        "combat",
+        "weapon",
+        "ui",
+        "machine",
+        "foley"
+      ],
+      "formats": [
+        "wav"
+      ],
+      "license": "Chequered Ink asset license",
+      "notes": "Select sounds by actual filename; trim/volume/looping are game decisions. Preserve creator/source attribution metadata.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "rayzn-medkit",
+      "title": "Emergency MedKit",
+      "author": "RayznGames",
+      "url": "https://rayzngames.itch.io/emergency-medkit-3d-model",
+      "kind": "prop",
+      "dimension": "3d",
+      "style": "realistic",
+      "tags": [
+        "medkit",
+        "health",
+        "pickup",
+        "medical",
+        "first-aid",
+        "prop"
+      ],
+      "formats": [
+        "fbx",
+        "obj",
+        "glb",
+        "gltf"
+      ],
+      "license": "CC-BY-4.0",
+      "notes": "Use model files from ZIP, not Unity package. Credit Ramon Serrate / RayznGames; check model scale and materials.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "styloo-weapons",
+      "title": "3D Weapons Asset Pack",
+      "author": "styloo",
+      "url": "https://styloo.itch.io/3d-weapons-asset-pack",
+      "kind": "prop",
+      "dimension": "3d",
+      "style": "low-poly",
+      "tags": [
+        "weapon",
+        "sword",
+        "axe",
+        "combat",
+        "fps",
+        "prop"
+      ],
+      "formats": [
+        "fbx",
+        "obj",
+        "glb"
+      ],
+      "license": "CC0-1.0",
+      "notes": "Check topology, scale and orientation. This is a mesh pack, not a weapon controller.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "ludonauta-weapon-guide",
+      "title": "Weapon System in Godot 4",
+      "author": "Ludonauta",
+      "url": "https://ludonauta.itch.io/gameplay-library/devlog/1576311/tutorial-weapon-system-in-godot-4",
+      "kind": "reference",
+      "dimension": "any",
+      "style": "any",
+      "tags": [
+        "weapon",
+        "shooting",
+        "inventory",
+        "combat",
+        "architecture",
+        "godot"
+      ],
+      "formats": [
+        "md"
+      ],
+      "license": "Publisher license",
+      "notes": "Task-specific reference. The linked devlog is a tutorial, not a downloadable weapon asset pack.",
+      "acquisition": "reference"
+    },
+    {
+      "id": "mana-seed-character",
+      "title": "Mana Seed Character Base",
+      "author": "Seliel the Shaper",
+      "url": "https://seliel-the-shaper.itch.io/character-base",
+      "kind": "character",
+      "dimension": "2d",
+      "style": "pixel",
+      "tags": [
+        "character",
+        "rpg",
+        "adventure",
+        "humanoid",
+        "walk",
+        "spritesheet",
+        "pixel"
+      ],
+      "formats": [
+        "png"
+      ],
+      "license": "Mana Seed User License",
+      "notes": "Use available demo or an authorized local full archive. Keep sprite frame/layer conventions; include source license metadata.",
+      "acquisition": "itch"
+    },
+    {
+      "id": "polyhaven-import",
+      "title": "Poly Haven Import",
+      "author": "Bytez",
+      "url": "https://store.godotengine.org/asset/bytez/poly-haven-import/",
+      "kind": "addon",
+      "dimension": "3d",
+      "style": "realistic",
+      "tags": [
+        "pbr",
+        "hdr",
+        "hdri",
+        "texture",
+        "material",
+        "model",
+        "polyhaven"
+      ],
+      "formats": [
+        "gd",
+        "tscn",
+        "tres"
+      ],
+      "license": "GPL-3.0",
+      "notes": "Editor addon marked unstable upstream. Keep it in the library until explicitly installed; never enable editor code as a side effect of an asset search.",
+      "acquisition": "github",
+      "repository": "Bytezz/godot-polyhaven-import"
+    }
+  ]
+}

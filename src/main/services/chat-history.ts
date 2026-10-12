@@ -1,10 +1,11 @@
-import { copyFile, cp, lstat, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, cp, lstat, mkdir, readdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type { ChatAttachment } from '../../shared/types'
+import { writeAtomic } from './json-file'
 
 /**
  * Per-project chat persistence, stored inside the game project under
- * .genieengine/ (gitignored — chat transcripts are personal, never shared):
+ * .solar/ (gitignored — chat transcripts are personal, never shared):
  *
  * - chat.json           the rendered transcript plus the OpenCode session id,
  *                       restored when the project is reopened. /clear deletes
@@ -31,7 +32,7 @@ import type { ChatAttachment } from '../../shared/types'
  * so a schema change degrades to "no recap", never a crash.
  */
 
-const STATE_DIR = '.genieengine'
+const STATE_DIR = '.solar'
 const CHAT_FILE = 'chat.json'
 const INPUT_FILE = 'input-history.json'
 const ATTACH_DIR = 'attachments'
@@ -56,35 +57,51 @@ async function readJson<T>(path: string): Promise<T | null> {
  * temp file + rename so a crash mid-write can't leave corrupt JSON behind.
  */
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
-  const tmp = `${path}.tmp`
-  await writeFile(tmp, JSON.stringify(value))
-  await rename(tmp, path)
+  await writeAtomic(path, JSON.stringify(value))
 }
 
-/** Projects whose .gitignore already got the .genieengine/ entry this run. */
+/** Preserve ordering of read/modify/write and clear operations for each project. */
+const pendingWrites = new Map<string, Promise<void>>()
+function serializeWrite(projectPath: string, work: () => Promise<void>): Promise<void> {
+  const operation = (pendingWrites.get(projectPath) ?? Promise.resolve()).then(work)
+  const settled = operation.catch(() => {})
+  pendingWrites.set(projectPath, settled)
+  void settled.then(() => {
+    if (pendingWrites.get(projectPath) === settled) pendingWrites.delete(projectPath)
+  })
+  return operation
+}
+
+/** Projects whose .gitignore already got the .solar/ entry this run. */
 const ignoreEnsured = new Set<string>()
 
 /**
- * Creates the project's .genieengine/ state dir and keeps it out of both git
+ * Creates the project's .solar/ state dir and keeps it out of both git
  * and Godot. Shared with test-harness.ts, which stores game screenshots here.
  */
 export async function ensureProjectStateDir(projectPath: string): Promise<string> {
   const dir = join(projectPath, STATE_DIR)
   await mkdir(dir, { recursive: true })
   if (!ignoreEnsured.has(projectPath)) {
-    ignoreEnsured.add(projectPath)
     // New projects get this via the template; this covers projects created
     // before chat persistence existed and imported Godot projects.
     const gitignorePath = join(projectPath, '.gitignore')
-    const current = await readFile(gitignorePath, 'utf8').catch(() => '')
+    const original = await readFile(gitignorePath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    const current = original ?? ''
     if (!current.split('\n').some((line) => line.trim().replace(/\/$/, '') === STATE_DIR)) {
-      const entry = `${current && !current.endsWith('\n') ? '\n' : ''}\n# GenieEngine local state (chat history, attachments, test screenshots)\n${STATE_DIR}/\n`
-      await writeFile(gitignorePath, current + entry).catch(() => {})
+      const entry = `${current && !current.endsWith('\n') ? '\n' : ''}\n# Solar local state (chat history, attachments, test screenshots)\n${STATE_DIR}/\n`
+      await writeAtomic(gitignorePath, current + entry, original).catch((error) => {
+        console.warn('[solar] could not update project .gitignore:', error)
+      })
     }
     // .gdignore makes Godot skip the directory entirely — without it the
     // editor would import attachments/screenshots as game resources (.import
     // sidecars) and drag them into exports.
     await writeFile(join(dir, '.gdignore'), '', { flag: 'wx' }).catch(() => {})
+    ignoreEnsured.add(projectPath)
   }
   return dir
 }
@@ -105,6 +122,10 @@ export async function saveChatHistory(
   messages: unknown[],
   sessionID: string | null
 ): Promise<void> {
+  return serializeWrite(projectPath, () => writeChatHistory(projectPath, messages, sessionID))
+}
+
+async function writeChatHistory(projectPath: string, messages: unknown[], sessionID: string | null): Promise<void> {
   const dir = await ensureProjectStateDir(projectPath)
   await writeJsonAtomic(join(dir, CHAT_FILE), { version: 1, sessionID, messages })
 }
@@ -119,27 +140,34 @@ export async function saveChatHistoryPreservingSession(
   projectPath: string,
   messages: unknown[]
 ): Promise<void> {
-  const existing = await readJson<{ sessionID?: unknown }>(join(projectPath, STATE_DIR, CHAT_FILE))
-  const sessionID = typeof existing?.sessionID === 'string' ? existing.sessionID : null
-  await saveChatHistory(projectPath, messages, sessionID)
+  return serializeWrite(projectPath, async () => {
+    const existing = await readJson<{ sessionID?: unknown }>(join(projectPath, STATE_DIR, CHAT_FILE))
+    const sessionID = typeof existing?.sessionID === 'string' ? existing.sessionID : null
+    await writeChatHistory(projectPath, messages, sessionID)
+  })
 }
 
 export async function appendInputHistory(projectPath: string, entry: string): Promise<void> {
   if (!entry.trim()) return
-  const dir = await ensureProjectStateDir(projectPath)
-  const path = join(dir, INPUT_FILE)
-  const entries = (await readJson<{ entries?: string[] }>(path))?.entries ?? []
-  if (entries[entries.length - 1] === entry) return // consecutive repeat
-  entries.push(entry)
-  await writeJsonAtomic(path, { version: 1, entries: entries.slice(-MAX_INPUT_ENTRIES) })
+  return serializeWrite(projectPath, async () => {
+    const dir = await ensureProjectStateDir(projectPath)
+    const path = join(dir, INPUT_FILE)
+    const saved = await readJson<{ entries?: unknown }>(path)
+    const entries = Array.isArray(saved?.entries) ? saved.entries.filter((item): item is string => typeof item === 'string') : []
+    if (entries[entries.length - 1] === entry) return // consecutive repeat
+    entries.push(entry)
+    await writeJsonAtomic(path, { version: 1, entries: entries.slice(-MAX_INPUT_ENTRIES) })
+  })
 }
 
 /** /clear: forget the transcript (input history intentionally stays). */
 export async function clearChatHistory(projectPath: string): Promise<void> {
-  await rm(join(projectPath, STATE_DIR, CHAT_FILE), { force: true })
-  // Attachments only exist for the conversation that referenced them — a
-  // cleared chat can't reach the old paths, so drop the files with it.
-  await rm(join(projectPath, STATE_DIR, ATTACH_DIR), { recursive: true, force: true })
+  return serializeWrite(projectPath, async () => {
+    await rm(join(projectPath, STATE_DIR, CHAT_FILE), { force: true })
+    // Attachments only exist for the conversation that referenced them — a
+    // cleared chat can't reach the old paths, so drop the files with it.
+    await rm(join(projectPath, STATE_DIR, ATTACH_DIR), { recursive: true, force: true })
+  })
 }
 
 // Recap limits: enough for the model to pick the conversation back up, small
@@ -166,6 +194,7 @@ export async function loadTranscriptRecap(projectPath: string): Promise<string |
   const { messages } = await loadChatState(projectPath)
   const lines: string[] = []
   for (const item of messages.slice(-RECAP_MAX_MESSAGES)) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue
     const m = item as { role?: unknown; content?: unknown; parts?: unknown }
     let text = ''
     if (m.role === 'user') {
@@ -215,7 +244,7 @@ async function ensureAttachmentsDir(projectPath: string): Promise<string> {
 }
 
 /**
- * Writes message attachments into .genieengine/attachments/ and returns their
+ * Writes message attachments into .solar/attachments/ and returns their
  * project-relative paths (POSIX-style, ready for the message text). Saving to
  * disk is what lets an image reach the image-enabled subagents: they never
  * see the data URLs riding the chat message — a file path handed through the
@@ -281,7 +310,7 @@ export interface SavedUpload {
 
 /**
  * Copies path-based asset uploads (zips, folders, binary asset files) into
- * .genieengine/attachments/. The copy — rather than referencing the original
+ * .solar/attachments/. The copy — rather than referencing the original
  * location — is what makes the upload usable at all: the assistant's sandbox
  * confines it to the project directory, so a path under ~/Downloads might as
  * well not exist. Throws (with a user-readable message) when a source is
@@ -300,10 +329,11 @@ export async function saveChatUploads(
     if (!upload.path) continue
     // stat (not lstat): a dropped path that is itself a symlink means the
     // user wants what it points at.
-    const info = await stat(upload.path).catch(() => null)
+    const source = await realpath(upload.path).catch(() => null)
+    const info = source ? await stat(source).catch(() => null) : null
     if (!info) throw new Error(`"${upload.name}" could not be read from ${upload.path}.`)
     if (info.isDirectory()) {
-      const { files, bytes } = await measureTree(upload.path)
+      const { files, bytes } = await measureTree(source!)
       if (bytes > MAX_UPLOAD_BYTES || files > MAX_UPLOAD_FILES) {
         throw new Error(
           `The folder "${upload.name}" is too large to attach — uploads are limited to ` +
@@ -311,7 +341,7 @@ export async function saveChatUploads(
         )
       }
       const name = `${stamp}-${i}-${slugName(upload.name, 'folder')}`
-      await cp(upload.path, join(dir, name), {
+      await cp(source!, join(dir, name), {
         recursive: true,
         // Symlinks are skipped, not resolved: a link reaching outside the
         // tree would silently defeat the size cap (and the sandbox would
@@ -329,7 +359,7 @@ export async function saveChatUploads(
       const ext = upload.name.match(/\.([A-Za-z0-9]+)$/)?.[1]
       const base = slugName(upload.name.replace(/\.[^.]*$/, ''), 'upload')
       const name = `${stamp}-${i}-${base}${ext ? `.${ext}` : ''}`
-      await copyFile(upload.path, join(dir, name))
+      await copyFile(source!, join(dir, name))
       saved.push({ rel: `${STATE_DIR}/${ATTACH_DIR}/${name}`, dir: false })
     }
   }

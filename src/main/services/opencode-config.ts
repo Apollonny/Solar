@@ -1,15 +1,19 @@
 import { app } from 'electron'
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { applyAgentConfig, configuredImageModel } from './opencode-setup'
+import { pathToFileURL } from 'node:url'
+import { applyAgentConfig, configuredImageModel, normalizeChatReasoningOptions, normalizeManagedProviderAdapters } from './opencode-setup'
+import { readJsonForUpdate, writeAtomic } from './json-file'
+import { gameTestBudgetInstructions } from '../../shared/agent-budget'
 
 /**
- * Keeps GenieEngine's entries in the user's global OpenCode config
+ * Keeps Solar's entries in the user's global OpenCode config
  * (~/.config/opencode/opencode.json) up to date at app startup:
  *
- *  - `mcp.genieengine` — the game-testing MCP bridge, giving the assistant the
+ *  - `mcp.solar` — the game-testing MCP bridge, giving the assistant the
  *    run_game_test / game_input / game_screenshot / game_state tools in every
  *    project. The bridge is spawned with the app's own binary in Node mode
  *    (ELECTRON_RUN_AS_NODE), so users don't need Node installed; it locates
@@ -17,7 +21,7 @@ import { applyAgentConfig, configuredImageModel } from './opencode-setup'
  *    config stays valid across app restarts. This file entry serves OpenCode
  *    sessions launched outside the app (e.g. a terminal); servers the app
  *    spawns get a per-spawn override pointing at their own instance instead
- *    (see genieengineMcpEntry).
+ *    (see solarMcpEntry).
  *  - `agent.image-reader` / `agent.game-tester` — the image-enabled subagents
  *    (see opencode-setup.ts). Re-applied here so users who never reopen the
  *    settings panel (upgrades) still get them, and so prompt/tool refinements
@@ -26,7 +30,7 @@ import { applyAgentConfig, configuredImageModel } from './opencode-setup'
  * Everything else in the config is the user's and is left untouched.
  */
 /**
- * This instance's `mcp.genieengine` entry, pointing at its own binary and
+ * This instance's `mcp.solar` entry, pointing at its own binary and
  * bridge script by absolute path (null when the bridge script is missing —
  * broken install). Used twice:
  *
@@ -67,11 +71,18 @@ function bundledResource(name: string): string | null {
  * layers (unlike other arrays, which replace), so instructions the user
  * configured themselves survive.
  */
-export function agentInstructionsPath(): string | null {
-  return bundledResource('agent-instructions.md')
+export async function agentInstructionsPath(): Promise<string | null> {
+  const source = bundledResource('agent-instructions.md')
+  if (!source) return null
+  const template = await readFile(source, 'utf8')
+  const contents = template.replaceAll('{{SOLAR_GAME_TEST_BUDGET}}', gameTestBudgetInstructions())
+  const hash = createHash('sha256').update(contents).digest('hex')
+  const target = join(app.getPath('userData'), 'agent-instructions', `${hash}.md`)
+  if (!existsSync(target)) await writeAtomic(target, contents)
+  return target
 }
 
-export function genieengineMcpEntry(): Record<string, unknown> | null {
+export function solarMcpEntry(): Record<string, unknown> | null {
   const bridgePath = bundledResource('mcp-bridge.mjs')
   if (!bridgePath) return null
   return {
@@ -82,31 +93,33 @@ export function genieengineMcpEntry(): Record<string, unknown> | null {
   }
 }
 
+export function solarSkillsPlugin(): string {
+  const plugin = bundledResource('solar-skills-plugin.mjs')
+  if (!plugin) throw new Error('The Solar native skill plugin is missing. Restore the application resources.')
+  return pathToFileURL(plugin).href
+}
+
 export async function ensureOpencodeConfig(): Promise<void> {
   try {
-    const entry = genieengineMcpEntry()
+    const entry = solarMcpEntry()
     if (!entry) return
 
     const configDir = join(homedir(), '.config', 'opencode')
     const configPath = join(configDir, 'opencode.json')
-    await mkdir(configDir, { recursive: true })
-
-    let config: Record<string, unknown> = {}
-    try {
-      config = JSON.parse(await readFile(configPath, 'utf8')) as Record<string, unknown>
-    } catch {
-      // Missing or invalid — start fresh (invalid JSON would break opencode anyway).
-    }
+    const { value: config, original } = await readJsonForUpdate(configPath)
     const before = JSON.stringify(config)
 
     const mcp = (config.mcp ?? {}) as Record<string, unknown>
-    mcp.genieengine = entry
+    if (mcp.genieengine && JSON.stringify(mcp.genieengine).includes('mcp-bridge.mjs')) {
+      delete mcp.genieengine
+    }
+    mcp.solar = entry
     config.mcp = mcp
 
     // Without this flag OpenCode halts the whole agent run when a permission
     // ask is rejected (the model only sees the denial after the user manually
     // prompts again). With it, a denial comes back as a normal tool error the
-    // agent can read and route around mid-run — GenieEngine answers every ask
+    // agent can read and route around mid-run — Solar answers every ask
     // automatically (see replyToPermission in opencode.ts), so a halt would
     // otherwise strand the chat on every rejected out-of-project access.
     const experimental = (config.experimental ?? {}) as Record<string, unknown>
@@ -114,11 +127,13 @@ export async function ensureOpencodeConfig(): Promise<void> {
     config.experimental = experimental
 
     applyAgentConfig(config, configuredImageModel(config))
+    normalizeManagedProviderAdapters(config)
+    normalizeChatReasoningOptions(config)
 
     if (!config.$schema) config.$schema = 'https://opencode.ai/config.json'
     if (JSON.stringify(config) === before) return
-    await writeFile(configPath, JSON.stringify(config, null, 2))
+    await writeAtomic(configPath, JSON.stringify(config, null, 2), original)
   } catch (err) {
-    console.error('[genieengine] failed to update opencode config:', err)
+    console.error('[solar] failed to update opencode config:', err)
   }
 }

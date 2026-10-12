@@ -1,8 +1,19 @@
 import { createHash, createHmac } from 'node:crypto'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
-import { join, resolve, sep } from 'node:path'
-import { assetDir, credentialsStore, IMAGE_MIME, slug } from './asset-store'
+import { readFile, rm } from 'node:fs/promises'
+import { join, sep } from 'node:path'
+import {
+  assetDir,
+  credentialsStore,
+  ensureProjectDirectory,
+  IMAGE_MIME,
+  resolveProjectFile,
+  slug,
+  validateProjectDirectory,
+  writeAssetFile
+} from './asset-store'
 import { extractZip } from './export'
+import type { CredentialUpdate } from './asset-store'
+import { normalizeApiKey } from '../../shared/provider-connection'
 
 /**
  * Tencent HY 3D ("Hunyuan To 3D Pro") client: generates 3D assets from a text
@@ -42,16 +53,25 @@ interface Hy3dCredentials extends Record<string, string> {
 const store = credentialsStore<Hy3dCredentials>('hy3d-credentials.json')
 
 export async function isHy3dConfigured(): Promise<boolean> {
-  return store.isConfigured()
+  const credentials = await store.load()
+  if (!credentials) return false
+  if (!normalizeApiKey(credentials.secretId,'Tencent SecretId') || !normalizeApiKey(credentials.secretKey,'Tencent SecretKey')) throw new Error('Stored Tencent credentials are invalid. Re-enter them in Settings.')
+  return true
 }
 
 /** Save (both fields non-empty) or clear (both empty) the Tencent credentials. */
 export async function saveHy3dCredentials(secretId: string, secretKey: string): Promise<void> {
-  const id = secretId.trim()
-  const key = secretKey.trim()
+  const id = normalizeApiKey(secretId,'Tencent SecretId')
+  const key = normalizeApiKey(secretKey,'Tencent SecretKey')
   if (!id && !key) return store.clear()
   if (!id || !key) throw new Error('Both the Tencent SecretId and SecretKey are required.')
   return store.save({ secretId: id, secretKey: key })
+}
+export async function prepareHy3dCredentials(secretId: string, secretKey: string): Promise<CredentialUpdate | null> {
+  const id = normalizeApiKey(secretId,'Tencent SecretId'), key = normalizeApiKey(secretKey,'Tencent SecretKey')
+  if (!id && !key) return null
+  if (!id || !key) throw new Error('Both the Tencent SecretId and SecretKey are required.')
+  return store.prepare({secretId:id,secretKey:key})
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +182,7 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
     throw new Error('Provide a "prompt" (text description) or an "image_path" reference image.')
   }
   const dir = assetDir(projectPath, request.folder, request.name)
+  await validateProjectDirectory(projectPath, dir.abs)
 
   const params: Record<string, unknown> = {
     EnablePBR: request.enablePBR ?? true,
@@ -170,8 +191,7 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
   }
   // Sketch mode is the only one where a prompt and an image may be combined.
   if (request.imagePath) {
-    const imageAbs = resolve(projectPath, request.imagePath)
-    if (!imageAbs.startsWith(resolve(projectPath) + sep)) throw new Error('image_path must be inside the project.')
+    const imageAbs = await resolveProjectFile(projectPath, request.imagePath)
     params.ImageBase64 = (await readFile(imageAbs)).toString('base64')
     if (request.prompt?.trim() && request.generateType === 'Sketch') params.Prompt = request.prompt.trim()
   } else {
@@ -204,7 +224,7 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
     }
     if (files3d.length === 0) throw new Error('3D generation finished but returned no files.')
 
-    await mkdir(dir.abs, { recursive: true })
+    const safeDir = await ensureProjectDirectory(projectPath, dir.abs)
     const written: string[] = []
     let previewBase64: string | undefined
     let previewMime: string | undefined
@@ -221,7 +241,7 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
       if (type === 'gif' || type === 'image') {
         const ext = extensionFromUrl(file.Url, type === 'gif' ? 'gif' : 'png')
         const name = `preview-turntable.${ext}`
-        await writeFile(join(dir.abs, name), data)
+        await writeAssetFile(safeDir, name, data)
         written.push(join(dir.rel, name))
         if (!turntableBase64 && IMAGE_MIME[ext]) {
           turntableBase64 = data.toString('base64')
@@ -229,15 +249,15 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
         }
       } else if (data.subarray(0, 4).toString('latin1').startsWith('PK')) {
         // Model archives (OBJ + MTL + textures) arrive zipped.
-        const archive = join(dir.abs, '_model.zip')
-        await writeFile(archive, data)
-        await extractZip(archive, dir.abs)
+        const archive = join(safeDir, '_model.zip')
+        await writeAssetFile(safeDir, '_model.zip', data)
+        await extractZip(archive, safeDir)
         await rm(archive, { force: true })
         written.push(dir.rel + sep + '(extracted model files)')
       } else {
         const ext = extensionFromUrl(file.Url, 'glb')
         const name = `${slug(request.name)}.${ext}`
-        await writeFile(join(dir.abs, name), data)
+        await writeAssetFile(safeDir, name, data)
         written.push(join(dir.rel, name))
       }
 
@@ -250,7 +270,7 @@ export async function generateAsset(projectPath: string, request: GenerateAssetR
           if (mime && mime !== 'image/gif') {
             const preview = Buffer.from(await previewRes.arrayBuffer())
             const name = `preview.${ext}`
-            await writeFile(join(dir.abs, name), preview)
+            await writeAssetFile(safeDir, name, preview)
             written.push(join(dir.rel, name))
             previewBase64 = preview.toString('base64')
             previewMime = mime

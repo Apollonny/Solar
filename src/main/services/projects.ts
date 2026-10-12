@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto'
+import { app } from 'electron'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type { ProjectInfo } from '../../shared/types'
+import { ensureProjectStateDir } from './chat-history'
 import { commit, init, stage } from './git'
-import { agentsMd, gitignore, iconSvg, mainGd, mainTscn, projectGodot } from './templates'
+import { agentsMd, gitignore, mainGd, mainTscn, projectGodot } from './templates'
 
 function slugify(name: string): string {
   return name
@@ -12,6 +14,12 @@ function slugify(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9-_ ]/g, '')
     .replace(/\s+/g, '-')
+}
+
+function bundledResourcePath(name: string): string {
+  return app.isPackaged
+    ? join(process.resourcesPath, 'app.asar.unpacked', 'resources', name)
+    : join(app.getAppPath(), 'resources', name)
 }
 
 async function readProjectName(dir: string): Promise<string> {
@@ -32,16 +40,27 @@ export async function createProject(parentDir: string, name: string): Promise<Pr
   const folder = slugify(trimmed) || 'my-game'
   const dir = join(parentDir, folder)
 
-  if (existsSync(dir) && (await readdir(dir)).length > 0) {
-    throw new Error(`Folder already exists and is not empty: ${dir}`)
+  await mkdir(parentDir, { recursive: true })
+  try {
+    // Reserve the target atomically so rapid requests cannot overwrite each other's starter files.
+    await mkdir(dir)
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error(`Folder already exists: ${dir}. Choose another game name or location.`)
+    }
+    throw err
   }
-  await mkdir(dir, { recursive: true })
+  const uiAssetsDir = join(dir, 'assets', 'ui')
+  await mkdir(uiAssetsDir, { recursive: true })
 
   await Promise.all([
     writeFile(join(dir, 'project.godot'), projectGodot(trimmed)),
     writeFile(join(dir, 'main.tscn'), mainTscn(trimmed)),
     writeFile(join(dir, 'main.gd'), mainGd(trimmed)),
-    writeFile(join(dir, 'icon.svg'), iconSvg()),
+    copyFile(bundledResourcePath('solar-project-icon.png'), join(dir, 'icon.png')),
+    copyFile(bundledResourcePath('solar-mark.png'), join(uiAssetsDir, 'solar-mark.png')),
+    copyFile(bundledResourcePath('sora-variable.ttf'), join(uiAssetsDir, 'Sora-Variable.ttf')),
+    copyFile(bundledResourcePath('sora-OFL.txt'), join(uiAssetsDir, 'OFL.txt')),
     writeFile(join(dir, '.gitignore'), gitignore()),
     writeFile(join(dir, 'AGENTS.md'), agentsMd(trimmed))
   ])
@@ -52,7 +71,7 @@ export async function createProject(parentDir: string, name: string): Promise<Pr
   try {
     await init(dir)
     await stage(dir, ['.'])
-    await commit(dir, 'Initial commit — created with GenieEngine')
+    await commit(dir, 'Initial commit — created with Solar')
   } catch {
     /* ignore */
   }
@@ -62,11 +81,11 @@ export async function createProject(parentDir: string, name: string): Promise<Pr
 
 /**
  * SHA-256 of every AGENTS.md body (everything after the title line, which
- * carries the project name) that a past GenieEngine version scaffolded —
+ * carries the project name) that a past Solar version scaffolded —
  * rendered from each historical agentsMd() in templates.ts's git history.
  * A body that hash-matches was written by the app and never edited, so
  * refreshAgentsMd may safely replace the file; anything else belongs to the
- * user (or the assistant, or a non-GenieEngine project) and is left alone.
+ * user (or the assistant, or a non-Solar project) and is left alone.
  *
  * When agentsMd() changes, add the OUTGOING version's hash here — sha256 of
  * agentsMd('x') after the first newline — or projects created on the old
@@ -81,7 +100,8 @@ const APP_OWNED_AGENTS_BODY_HASHES = new Set([
   '0b2bcbb08334ae49e0d55530034895177a6e90c434c9e691eb23e7c425a1f477', // 68e9314
   '8fb4d86fbe7d01774059d6ea857ba35b0a61b182805442b1c9b942fa40918c6b', // c1f0186
   'd724eddeac410d986eeb994df0508ec366bc27b6a544c15091c000584e659d6f', // 48a75b9
-  '6d0daa704600515b97ed8755c89af42b1b7d5c8636adb314b2808bfb4b3d1ffe' // 48a75b9 + uncommitted 2026-07 test-budget edits
+  '6d0daa704600515b97ed8755c89af42b1b7d5c8636adb314b2808bfb4b3d1ffe', // 48a75b9 + uncommitted 2026-07 test-budget edits
+  '151e4cac9e17ce46067f2848b1df94ce37ed3475bc51a9d4611b1fdb2c33a8ab' // pre-Solar template
 ])
 
 function agentsBodyHash(content: string): string {
@@ -92,7 +112,7 @@ function agentsBodyHash(content: string): string {
 
 /**
  * Upgrade a scaffolded AGENTS.md to the current template when the project is
- * opened. Early GenieEngine versions froze the full build rules into each
+ * opened. Early Solar versions froze the full build rules into each
  * project's AGENTS.md; those rules now ship with the app and are injected per
  * chat-server spawn (see agentInstructionsPath in opencode-config.ts), so a
  * stale copy would sit in the system prompt alongside — and contradict — the
@@ -119,10 +139,20 @@ export async function openProject(dir: string): Promise<ProjectInfo> {
   if (!existsSync(join(dir, 'project.godot'))) {
     throw new Error(
       'The selected folder is not a Godot project (no project.godot found). ' +
-        'Choose a project created with GenieEngine or an existing Godot 4 project.'
+        'Choose a project created with Solar or an existing Godot 4 project.'
     )
   }
   const name = await readProjectName(dir)
+  const legacyState = join(dir, '.genieengine')
+  const solarState = join(dir, '.solar')
+  if (existsSync(legacyState) && !existsSync(solarState)) {
+    try {
+      await rename(legacyState, solarState)
+    } catch (error) {
+      throw new Error(`Could not migrate this project's saved chat and attachments to Solar: ${String(error)}`)
+    }
+  }
+  await ensureProjectStateDir(dir)
   await refreshAgentsMd(dir, name)
   return { path: dir, name }
 }

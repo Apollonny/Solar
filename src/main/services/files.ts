@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { readdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import type { FileEntry } from '../../shared/types'
 import { findBinary } from './binaries'
@@ -22,11 +22,22 @@ export async function listDir(dir: string): Promise<FileEntry[]> {
 }
 
 export async function openInVSCode(target: string): Promise<void> {
-  const code = await findBinary('code', [
+  let code = await findBinary('code', [
     '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code'
   ])
+  if (code && process.platform === 'win32' && /\.(cmd|bat)$/i.test(code)) {
+    // Windows cannot spawn .cmd directly. Use the app executable without shell interpolation.
+    code = await findBinary('Code', [
+      join(dirname(code), '..', 'Code.exe'),
+      join(dirname(code), '..', 'Code - Insiders.exe')
+    ])
+  }
   if (code) {
-    spawn(code, [target], { detached: true, stdio: 'ignore' }).unref()
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(code!, [target], { detached: true, stdio: 'ignore' })
+      child.on('error', reject)
+      child.once('spawn', () => { child.unref(); resolve() })
+    })
     return
   }
   if (process.platform === 'darwin') {

@@ -1,11 +1,11 @@
 import { app, nativeImage } from 'electron'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { readdir, readFile, rm } from 'node:fs/promises'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { ensureProjectStateDir } from './chat-history'
-import { getCurrentProject } from '../state'
+import { getCurrentProject, getProductionEnabled } from '../state'
 import { sendToRenderer } from '../window'
 import {
   consumeTestBudget,
@@ -21,6 +21,17 @@ import { generateImageAsset, isGptImageConfigured } from './gptimage'
 import { generateAsset, isHy3dConfigured, type GenerateAssetRequest } from './hy3d'
 import { downloadItchAsset, searchItchAssets } from './itch'
 import type { AssetPreview } from '../../shared/types'
+import type { ValidationMode } from '../../shared/agent-task'
+import { gameTestBudgetInstructions } from '../../shared/agent-budget'
+import { getActiveAgentRun, getBoundAgentRun } from './agent-run-metrics'
+import { cancelProjectValidations, validateProject } from './project-validation'
+import { gameGuidance } from './game-guidance'
+import { getReferenceSession,recordAssetSelections,productionAssetSelections } from './production-policy'
+import type { GuidanceScope } from './guidance-scope'
+import { productionGuidance } from './production-guidance'
+import { queryAssetLibrary, recommendAssetLibrary, readLibraryAsset, importLegacyLibraryAssets, assetCatalog } from './asset-library'
+import type { AssetQuery } from '../../shared/asset-library'
+import {assertSelectedAssets,recommendationsToReceipts,taskAssetAllowed} from '../../shared/ai-task-selection'
 
 /**
  * Local HTTP API that exposes the AI game-testing tools to the MCP bridge
@@ -36,7 +47,7 @@ let endpoint: { port: number; token: string } | null = null
 /**
  * This instance's harness address. Injected into the env of every OpenCode
  * server we spawn so the bridge always reaches THIS app instance. harness.json
- * can't provide that guarantee: it's one file shared by every GenieEngine
+ * can't provide that guarantee: it's one file shared by every Solar
  * instance (dev + packaged can run side by side), so it holds whichever
  * instance registered last — the file is only a fallback for OpenCode
  * sessions that weren't launched by the app (e.g. the opencode CLI).
@@ -53,7 +64,7 @@ function harnessFilePath(): string {
 const KEEP_SHOTS = 12
 
 /**
- * Screenshots live INSIDE the project (.genieengine/test-shots/, gitignored and
+ * Screenshots live INSIDE the project (.solar/test-shots/, gitignored and
  * .gdignore'd via ensureProjectStateDir). They used to go to the app's
  * userData dir, and handing that ~/Library path to the model lured it into
  * reading/copying outside the project — which the permission policy rejects
@@ -118,22 +129,79 @@ function pushAssetPreview(base64: string, mime: string, label: string, files: st
 /** The per-run budget applies to these (each one costs a model round trip). */
 const BUDGETED_TOOLS = new Set(['game_input', 'game_state', 'game_scene_tree', 'game_screenshot', 'game_logs'])
 
-async function runTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
-  if (!BUDGETED_TOOLS.has(name)) return dispatchTool(name, args)
+async function runTool(name: string, args: Record<string, unknown>, signal: AbortSignal, scope?: GuidanceScope): Promise<ToolResult> {
+  const run = getActiveAgentRun(getCurrentProject()?.path)
+  const id = `harness:${randomUUID()}`
+  run?.tool(id, name, 'running')
+  try {
+    const result = await runBudgetedTool(name, args, signal, scope)
+    run?.tool(id, name, result.ok ? 'completed' : 'error')
+    return result
+  } catch (error) {
+    run?.tool(id, name, 'error')
+    throw error
+  }
+}
+
+async function runBudgetedTool(name: string, args: Record<string, unknown>, signal: AbortSignal, scope?: GuidanceScope): Promise<ToolResult> {
+  if (!BUDGETED_TOOLS.has(name)) return dispatchTool(name, args, signal, scope)
   // See consumeTestBudget (game.ts) for why runaway test runs must be capped.
   // game_logs stays usable past exhaustion so the final report can quote logs.
   const budget = consumeTestBudget()
   if (budget.exhausted && name !== 'game_logs') return { ok: false, text: budget.notice! }
-  const result = await dispatchTool(name, args)
+  const result = await dispatchTool(name, args, signal, scope)
   if (budget.notice && result.ok) result.text = `${result.text}\n\n${budget.notice}`
   return result
 }
 
-async function dispatchTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+async function dispatchTool(name: string, args: Record<string, unknown>, signal: AbortSignal, scope?: GuidanceScope): Promise<ToolResult> {
   switch (name) {
+    case 'asset_library': {
+      const action = args.action ?? 'search'
+      if(!scope?.selection||!scope.sessionId)throw new Error('Asset use needs an active task selection lease. Start a Solar chat task first.')
+      if(!['developer','legacy-developer'].includes(scope.role)||!['search','inspect','read','recommend',...(scope.role==='legacy-developer'?['import']:[])].includes(String(action)))throw new Error('Asset selection belongs to the Developer task only.')
+      if (action === 'import') {
+        const project = getCurrentProject(); if(!project)throw new Error('Open a project before importing assets.')
+        const selected=[{packId:String(args.packId??''),files:args.files as import('../../shared/asset-library').AssetImport['files']}]
+        if(!Array.isArray(selected[0].files)||!selected[0].files.length)throw new Error('Select exact recommended asset files.')
+        assertSelectedAssets(selected,productionAssetSelections(scope.sessionId))
+        const paths = await importLegacyLibraryAssets(project.path, selected, signal)
+        return {ok:true,text:JSON.stringify({paths,notes:'Library dependencies and provenance were imported. Wire exact res:// paths into scenes; validate and run the feature before claiming completion.'})}
+      }
+      if (action === 'read') {
+        const pack=(await assetCatalog()).find(pack=>pack.id===args.packId)
+        if(!pack||!taskAssetAllowed(pack,scope.selection))throw new Error('This asset pack conflicts with the current task scope.')
+        return {ok:true,text:await readLibraryAsset(pack.id,String(args.path??''))}
+      }
+      if (!['search', 'inspect', 'recommend'].includes(String(action))) throw new Error('The asset library is read-only. Request exact files in ChangeSet.assetImports.')
+      const matches=await (action==='recommend'?recommendAssetLibrary:queryAssetLibrary)({...args,query:String(args.query??'')} as unknown as AssetQuery,scope.selection)
+      signal.throwIfAborted()
+      if(action==='recommend')recordAssetSelections(scope.sessionId,recommendationsToReceipts(matches))
+      return {ok:true,text:JSON.stringify(matches)}
+    }
+    case 'game_guidance': {
+      const run = getActiveAgentRun(getCurrentProject()?.path)
+      const result = await gameGuidance(args, run ? AbortSignal.any([signal, run.controller.signal]) : signal, scope)
+      return { ok: true, text: JSON.stringify(result) }
+    }
+    case 'production_guidance': return { ok: true, text: JSON.stringify(await productionGuidance(args, scope)) }
+    case 'project_validate': {
+      const project = getCurrentProject()
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
+      const run = getActiveAgentRun(project.path)
+      const result = await validateProject(project.path, {
+        mode: args.mode as ValidationMode | undefined,
+        paths: args.paths as string[] | undefined,
+        runId: run?.identity.runId,
+        taskRevision: run?.identity.taskRevision,
+        signal: run ? AbortSignal.any([signal, run.controller.signal]) : signal
+      })
+      run?.validation(result)
+      return { ok: result.status === 'pass', text: JSON.stringify(result) }
+    }
     case 'run_game_test': {
       const project = getCurrentProject()
-      if (!project) return { ok: false, text: 'No project is open in GenieEngine.' }
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
       await startGameTest(project.path)
       // Windowed fallback platforms have no off-screen embedding — say where
       // the game actually went so the model reports it accurately.
@@ -155,7 +223,7 @@ async function dispatchTool(name: string, args: Record<string, unknown>): Promis
     }
     case 'game_screenshot': {
       const project = getCurrentProject()
-      if (!project) return { ok: false, text: 'No project is open in GenieEngine.' }
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
       const dir = join(await ensureProjectStateDir(project.path), 'test-shots')
       mkdirSync(dir, { recursive: true })
       const file = `shot-${Date.now()}.png`
@@ -171,7 +239,7 @@ async function dispatchTool(name: string, args: Record<string, unknown>): Promis
       return {
         ok: true,
         text:
-          `Screenshot saved inside the project at .genieengine/test-shots/${file}. ` +
+          `Screenshot saved inside the project at .solar/test-shots/${file}. ` +
           'If you cannot view the attached image yourself, pass that path to the ' +
           'image-reader subagent — it reads it directly; never copy screenshots elsewhere.',
         imageBase64: shot.base64,
@@ -195,7 +263,7 @@ async function dispatchTool(name: string, args: Record<string, unknown>): Promis
     }
     case 'generate_3d_asset': {
       const project = getCurrentProject()
-      if (!project) return { ok: false, text: 'No project is open in GenieEngine.' }
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
       const result = await generateAsset(project.path, {
         prompt: typeof args.prompt === 'string' ? args.prompt : undefined,
         imagePath: typeof args.image_path === 'string' ? args.image_path : undefined,
@@ -225,7 +293,7 @@ async function dispatchTool(name: string, args: Record<string, unknown>): Promis
     }
     case 'generate_2d_asset': {
       const project = getCurrentProject()
-      if (!project) return { ok: false, text: 'No project is open in GenieEngine.' }
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
       const result = await generateImageAsset(project.path, {
         prompt: String(args.prompt ?? ''),
         folder: String(args.folder ?? ''),
@@ -250,9 +318,9 @@ async function dispatchTool(name: string, args: Record<string, unknown>): Promis
     }
     case 'itch_download': {
       const project = getCurrentProject()
-      if (!project) return { ok: false, text: 'No project is open in GenieEngine.' }
+      if (!project) return { ok: false, text: 'No project is open in Solar.' }
       const text = await downloadItchAsset(project.path, String(args.url ?? ''))
-      // Staged under .genieengine/ (hidden from the sidebar today), but keep
+      // Staged under .solar/ (hidden from the sidebar today), but keep
       // the post-write convention the other file-writing tools follow.
       sendToRenderer('chat:files-changed')
       return { ok: true, text }
@@ -295,14 +363,14 @@ export function startTestHarness(): void {
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify(payload))
     }
-    if (!tokenMatches(req.headers['x-genieengine-token'], token)) {
+    if (!tokenMatches(req.headers['x-solar-token'], token)) {
       respond(403, { ok: false, text: 'invalid token' })
       return
     }
     // Which optional tools are available — the MCP bridge checks this at
     // startup so unconfigured tools are never offered to the model.
     if (req.method === 'GET' && req.url === '/capabilities') {
-      respond(200, { hy3d: await isHy3dConfigured(), gptImage: await isGptImageConfigured() })
+      respond(200, { hy3d: await isHy3dConfigured(), gptImage: await isGptImageConfigured(), gameTestBudget: gameTestBudgetInstructions() })
       return
     }
     if (req.method !== 'POST' || req.url !== '/tool') {
@@ -310,11 +378,23 @@ export function startTestHarness(): void {
       return
     }
     try {
-      const { name, arguments: args } = JSON.parse(await readBody(req)) as {
+      const { name, arguments: args, projectPath, executorSessionID } = JSON.parse(await readBody(req)) as {
         name: string
         arguments?: Record<string, unknown>
+        projectPath?: string
+        executorSessionID?: string
       }
-      respond(200, await runTool(name, args ?? {}))
+      const lease = executorSessionID === undefined ? undefined : typeof executorSessionID === 'string' ? getReferenceSession(executorSessionID) : undefined
+      if(executorSessionID!==undefined&&(!lease||!projectPath||resolve(lease.projectPath)!==resolve(projectPath)||lease.toolAllowlist&&!lease.toolAllowlist.includes('solar_'+name)||lease.role!=='legacy-developer'&&!['game_guidance','production_guidance','asset_library'].includes(name)))throw new Error('Invalid, expired or out-of-role task reference lease.')
+      if(getProductionEnabled()&&!lease)throw new Error('Microsoft mode requires a dispatched executor lease; unscoped tool calls are unavailable.')
+      if (projectPath !== undefined && (typeof projectPath !== 'string' || resolve(projectPath) !== resolve(getCurrentProject()?.path ?? ''))) throw new Error('The project changed; this tool call belongs to the previous project.')
+      if (projectPath && getBoundAgentRun(projectPath)?.controller.signal.aborted && !['stop_game_test', 'game_logs'].includes(name)) throw new Error('This AI task has finished or was stopped. Start a new chat turn before calling more tools.')
+      if (typeof name !== 'string' || (args !== undefined && (!args || typeof args !== 'object' || Array.isArray(args)))) throw new Error('Invalid tool request.')
+      const controller = new AbortController()
+      const disconnected = (): void => { if (!res.writableEnded) controller.abort() }
+      res.once('close', disconnected)
+      try { respond(200, await runTool(name, args ?? {}, controller.signal, lease)) }
+      finally { res.removeListener('close', disconnected) }
     } catch (err) {
       respond(200, { ok: false, text: err instanceof Error ? err.message : String(err) })
     }
@@ -335,10 +415,11 @@ export function startTestHarness(): void {
 }
 
 export function stopTestHarness(): void {
+  void cancelProjectValidations()
   server?.close()
   server = null
   // Only remove harness.json if it still holds OUR registration. Another
-  // GenieEngine instance may have overwritten it since we launched (the file is
+  // Solar instance may have overwritten it since we launched (the file is
   // shared), and deleting theirs would strand that still-running instance —
   // this exact race broke the packaged app while a dev instance quit.
   try {

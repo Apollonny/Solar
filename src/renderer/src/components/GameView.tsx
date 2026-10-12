@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AspectMode, GameInputModifiers, GameState } from '../../../shared/types'
-import { PlayIcon, StopIcon, XIcon } from './Icons'
+import { MonitorIcon, PlayIcon, StopIcon, XIcon } from './Icons'
+import { readSolarStorage, writeSolarStorage } from '../storage'
 
 /** width/height ratios for enforced preview shapes (modern phones ≈ 19.5:9). */
 const ASPECT_RATIOS: Partial<Record<AspectMode, number>> = {
@@ -169,7 +170,7 @@ interface Props {
 }
 
 const MAX_LOG_LINES = 500
-const CONSOLE_HEIGHT_KEY = 'genieengine:consoleHeight'
+const CONSOLE_HEIGHT_KEY = 'consoleHeight'
 const CONSOLE_MIN = 80
 const CONSOLE_MAX = 600
 
@@ -197,7 +198,7 @@ export function GameView({
 
   // Console height, drag-resizable like the sidebar (persisted).
   const [consoleHeight, setConsoleHeight] = useState(() => {
-    const saved = Number(localStorage.getItem(CONSOLE_HEIGHT_KEY))
+    const saved = Number(readSolarStorage(CONSOLE_HEIGHT_KEY))
     return saved >= CONSOLE_MIN && saved <= CONSOLE_MAX ? saved : 160
   })
 
@@ -214,7 +215,7 @@ export function GameView({
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       setConsoleHeight((h) => {
-        localStorage.setItem(CONSOLE_HEIGHT_KEY, String(h))
+        writeSolarStorage(CONSOLE_HEIGHT_KEY, String(h))
         return h
       })
     }
@@ -364,12 +365,12 @@ export function GameView({
         </button>
         <h2>Press Run to start your game</h2>
         <p className="muted">
-          Your game runs right here in GenieEngine. Ask the assistant in the chat to build or change
+          Your game runs right here in Solar. Ask the assistant in the chat to build or change
           anything.
         </p>
         {!godotPath && (
           <button className="warning-chip" onClick={onLocateGodot}>
-            Bundled Godot engine missing — reinstall GenieEngine, or click to locate one
+            Bundled Godot engine missing — reinstall Solar, or click to locate one
           </button>
         )}
       </div>
@@ -378,23 +379,36 @@ export function GameView({
 
   const embedded = state.status === 'running'
 
-  // The FPS readout lives in a strip ABOVE the stage: the native game layer
-  // is composited over the web contents, so DOM drawn inside the stage rect
-  // would be invisible behind the running game.
+  // The toolbar stays outside the stage because the native game layer is
+  // composited over any DOM drawn inside the stage rectangle.
   const showFpsBar = embedded && state.mode === 'native'
+  const previewStatus = error
+    ? 'Needs attention'
+    : state.status === 'starting'
+      ? 'Starting'
+      : state.status === 'running'
+        ? state.mode === 'test' ? 'AI testing' : 'Running'
+        : !godotPath ? 'Godot missing' : 'Ready to run'
+  const previewState = error ? 'error' : state.status === 'running' ? 'running' : state.status === 'starting' ? 'starting' : !godotPath ? 'warning' : 'ready'
 
   return (
     <section className="game-area" ref={areaRef}>
-      {showFpsBar && (
-        <div className="stage-toolbar">
+      <div className="stage-toolbar">
+        <span className="stage-toolbar-title"><MonitorIcon size={15} /> Game preview</span>
+        <div className="stage-toolbar-meta">
+          {showFpsBar && (
           <span
             className={`fps-badge${fps !== null && fps < 30 ? ' bad' : fps !== null && fps < 50 ? ' warn' : ''}`}
-            title="Frame rate measured in the game process. Per-minute stats (min/max/avg/1% low/0.1% low) are logged to .genieengine/perf.log"
+            title="Frame rate measured in the game process. Per-minute stats (min/max/avg/1% low/0.1% low) are logged to .solar/perf.log"
           >
             {fps !== null ? `${Math.round(fps)} FPS` : '— FPS'}
           </span>
+          )}
+          <span className={`preview-state ${previewState}`} role="status" aria-live="polite">
+            <span className="preview-state-dot" />{previewStatus}
+          </span>
         </div>
-      )}
+      </div>
       <div ref={stageRef} className={embedded ? 'game-stage embedded' : 'game-stage'}>
         {error && (
           <div className="error-banner">

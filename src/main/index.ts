@@ -1,16 +1,27 @@
 import { app, BrowserWindow, shell } from 'electron'
 import { join } from 'node:path'
 import { registerIpcHandlers } from './ipc'
+import { migrateUserData, preserveLegacyUserDataPath } from './services/brand-migration'
 import { loadShellPath } from './services/binaries'
 import { stopGame } from './services/game'
+import { closeSceneEditor, sceneEditorMustCloseBeforeWindow } from './services/scene-editor'
 import { shutdownChat } from './services/opencode'
+import { cancelProduction } from './services/production-workflow'
+import { cancelProjectValidations } from './services/project-validation'
+import { flushAgentMetrics } from './services/agent-run-metrics'
 import { ensureOpencodeConfig } from './services/opencode-config'
 import { startTestHarness, stopTestHarness } from './services/test-harness'
 import { loadSettings } from './state'
 import { sendToRenderer, setMainWindow } from './window'
 
-// Keeps the userData (settings) folder stable between dev and packaged runs.
-app.setName('GenieEngine')
+// Keep existing installs on the original profile so Electron safeStorage can
+// still decrypt credentials encrypted before the Solar rebrand.
+app.setName('Solar')
+preserveLegacyUserDataPath()
+
+function shutdownTrace(message: string): void {
+  if (process.env.SOLAR_SHUTDOWN_DIAGNOSTICS === '1') console.log(`[solar] shutdown: ${message}`)
+}
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -19,8 +30,8 @@ function createWindow(): void {
     minWidth: 1024,
     minHeight: 640,
     show: false,
-    backgroundColor: '#0e0e13',
-    title: 'GenieEngine',
+    backgroundColor: '#08090e',
+    title: 'Solar',
     // Frameless-style titlebar on macOS for a modern, engine-like look.
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const } : {}),
     webPreferences: {
@@ -32,6 +43,18 @@ function createWindow(): void {
 
   setMainWindow(win)
   win.on('ready-to-show', () => win.show())
+  let closeAfterScene = false
+  win.on('close', (event) => {
+    shutdownTrace(`window close; editor pending=${sceneEditorMustCloseBeforeWindow()}`)
+    if (closeAfterScene || !sceneEditorMustCloseBeforeWindow()) return
+    event.preventDefault()
+    void cancelProduction().then(() => closeSceneEditor()).then(() => {
+      closeAfterScene = true
+      if (!win.isDestroyed()) win.close()
+    }).catch((error) => {
+      console.error('[solar] scene editor could not close:', error)
+    })
+  })
 
   // The macOS traffic lights (hiddenInset title bar) disappear in native
   // fullscreen — the renderer needs to know so it can collapse the padding
@@ -72,6 +95,7 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  await migrateUserData()
   await loadShellPath()
   loadSettings()
   // Before any chat server starts: OpenCode reads its config at boot.
@@ -85,7 +109,33 @@ app.whenReady().then(async () => {
   })
 })
 
-app.on('before-quit', () => {
+let quittingAfterGodot = false
+let godotClosedForQuit = false
+app.on('before-quit', (event) => {
+  shutdownTrace(`before quit; cleanup complete=${godotClosedForQuit}`)
+  if (!godotClosedForQuit) {
+    event.preventDefault()
+    if (!quittingAfterGodot) {
+      quittingAfterGodot = true
+      shutdownChat()
+      stopGame()
+      stopTestHarness()
+      shutdownTrace('chat, game and tool server stopped; cancelling workflows/validation')
+      // Keep the authenticated editor alive until its owned runtime has stopped.
+      void Promise.allSettled([cancelProduction(), cancelProjectValidations()]).then(async (results) => {
+        shutdownTrace('workflows/validation cancelled; closing editor and flushing metrics')
+        for (const result of results) if (result.status === 'rejected') console.warn('[solar] shutdown cleanup failed:', result.reason)
+        const closed = await Promise.allSettled([closeSceneEditor(), flushAgentMetrics()])
+        shutdownTrace('editor closed and metrics flushed')
+        for (const result of closed) if (result.status === 'rejected') console.warn('[solar] shutdown cleanup failed:', result.reason)
+      }).finally(() => {
+        godotClosedForQuit = true
+        shutdownTrace('requesting final quit')
+        app.quit()
+      })
+    }
+    return
+  }
   // Don't leave orphaned godot/opencode processes behind.
   stopGame()
   shutdownChat()
@@ -93,5 +143,8 @@ app.on('before-quit', () => {
 })
 
 app.on('window-all-closed', () => {
+  shutdownTrace('all windows closed')
   app.quit()
 })
+app.on('will-quit', () => shutdownTrace('will quit'))
+app.on('quit', () => shutdownTrace('quit'))

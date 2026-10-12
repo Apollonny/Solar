@@ -36,6 +36,8 @@ export interface GitRemote {
 }
 
 export interface GitChange {
+  /** Renames must update both paths when staging or unstaging. */
+  originalPath?: string
   path: string
   /** Single-letter status code shown in the UI (M, A, D, R, ?, …). */
   status: string
@@ -63,6 +65,8 @@ export interface ChatDonePayload {
   ok: boolean
   cancelled?: boolean
   error?: string
+  recoverable?: boolean
+  resumeRunId?: string
 }
 
 /**
@@ -73,7 +77,7 @@ export interface ChatDonePayload {
  * - Asset upload (`path` set): .zip archives, whole folders, and binary asset
  *   files (3D models, audio, fonts) — too big/opaque to inline, so only the
  *   absolute disk path crosses to the main process, which copies the payload
- *   into the project's .genieengine/attachments/ when the message is sent and
+ *   into the project's .solar/attachments/ when the message is sent and
  *   points the assistant at it there.
  */
 export interface ChatAttachment {
@@ -127,13 +131,6 @@ export interface ChatQuestionRequest {
 }
 
 /**
- * Which chat model a message runs on: the everyday Medium model or the
- * heavyweight Large model for tough tasks (more capable, may cost more).
- * The image model is not a tier — it only powers the image subagents.
- */
-export type ChatModelTier = 'medium' | 'large'
-
-/**
  * Whether the model should think before answering. Sent to the model as the
  * standard OpenAI-format `thinking: {"type": "enabled"|"disabled"}` request
  * field (see https://api-docs.deepseek.com/guides/thinking_mode/);
@@ -141,47 +138,102 @@ export type ChatModelTier = 'medium' | 'large'
  */
 export type ThinkingMode = 'default' | 'enabled' | 'disabled'
 
-/**
- * How hard the model should think, sent as the standard OpenAI-format
- * `reasoning_effort` request field; 'default' sends nothing.
- */
+/** Shared reasoning scale. The main process maps it to each provider's options; `default` sends no override. */
 export type ReasoningEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type ModelSlotId = 'medium' | 'large' | 'image'
+
+/** AI API family used by one model slot. `custom` is an OpenAI-compatible endpoint. */
+export type ModelProviderId = 'openrouter' | 'openai' | 'anthropic' | 'gemini' | 'xai' | 'nvidia' | 'custom'
 
 /** One model slot's stored connection settings, as shown in the setup panel. */
 export interface ModelSlotStatus {
-  /** Base URL of the OpenAI-compatible API this model is served from. */
+  /** API family selected for this slot. */
+  provider: ModelProviderId
+  /** Provider base URL, including a custom gateway when configured. */
   endpoint: string
   model: string
-  /** True once this model's endpoint has a usable credential. */
+  /** A credential is locally available for this exact connection; generation access is not implied. */
   configured: boolean
   thinking: ThinkingMode
   effort: ReasoningEffort
+  /** Model-specific choices when known; null means the provider did not publish them. */
+  reasoningEfforts?: Exclude<ReasoningEffort, 'default'>[] | null
+  /** Models with token-budget reasoning use this upper bound. */
+  reasoningBudgetMax?: number | null
+  /** Native Anthropic control selected from the model's published capabilities. */
+  reasoningMode?: 'adaptive' | 'effort' | 'budget' | null
+}
+
+/** A legacy OpenCode API key currently stored in the shared auth.json file. */
+export interface LegacyOpenCodeCredential {
+  providerId: string
+  slotLabels: string[]
+}
+
+/** Encrypted snapshot of auth.json made before a legacy credential migration. */
+export interface OpenCodeAuthBackupStatus {
+  id: string
+  /** True only while auth.json still exactly matches the migrated snapshot. */
+  restorable: boolean
 }
 
 /** State of the AI provider setup (API keys / endpoints / models). */
 export interface SetupStatus {
-  /** True once both chat models are usable (the chat dropdown can switch between them any time). */
+  /** The chat connection has a locally available credential; generation access is not implied. */
   configured: boolean
-  /** Everyday chat/coding model. */
-  medium: ModelSlotStatus
-  /** Heavyweight chat model for tough tasks. */
-  large: ModelSlotStatus
+  /** The model used for every assistant conversation. */
+  chat: ModelSlotStatus
   /** Image-enabled model that powers the image-reader and game-tester subagents. */
   image: ModelSlotStatus
   /** True when Tencent HY 3D credentials are stored (enables 3D asset generation). */
   hy3dConfigured: boolean
   /** True when an OpenAI key is stored (enables 2D image asset generation). */
   gptImageConfigured: boolean
+  /** Eligible API keys in OpenCode's shared plaintext auth file. */
+  legacyOpenCodeCredentials: LegacyOpenCodeCredential[]
+  /** Most recent encrypted auth.json backup, when one exists. */
+  latestOpenCodeAuthBackup: OpenCodeAuthBackupStatus | null
+  /** Read errors from OS-encrypted credential stores; settings remain available for recovery. */
+  credentialStoreError?: string
 }
 
 /** One model slot's settings as submitted by the setup panel. */
 export interface ModelSlotRequest {
+  provider: ModelProviderId
   endpoint: string
   model: string
-  /** Blank = keep the stored key (or share the Medium model's key on a matching endpoint). */
+  /** Blank = keep the stored key for this provider and endpoint. */
   apiKey: string
   thinking: ThinkingMode
   effort: ReasoningEffort
+  /** Catalog-confirmed effort choices, or null when the provider has no exact metadata. */
+  reasoningEfforts?: Exclude<ReasoningEffort, 'default'>[] | null
+  /** Catalog-confirmed upper bound for token-budget reasoning. */
+  reasoningBudgetMax?: number | null
+  reasoningMode?: 'adaptive' | 'effort' | 'budget' | null
+}
+
+/** Request to fetch a provider's available language model IDs for one slot. */
+export interface ModelCatalogRequest {
+  slot: ModelSlotId
+  provider: ModelProviderId
+  endpoint: string
+  /** Blank asks the main process to use the slot's encrypted or saved key. */
+  apiKey: string
+}
+
+/** Provider catalog entry with image-input capability when the provider reports it. */
+export interface ModelCatalogItem {
+  id: string
+  /** null means this provider did not publish image-input support for the model. */
+  supportsImageInput: boolean | null
+  /** Exact model-specific values when published by the provider. */
+  reasoningEfforts?: Exclude<ReasoningEffort, 'default'>[] | null
+  /** Upper bound when reasoning is controlled by a token budget instead of an effort enum. */
+  reasoningBudgetMax?: number | null
+  reasoningMode?: 'adaptive' | 'effort' | 'budget' | null
+  /** Whether reasoning controls are advertised when exact values are not published. */
+  supportsReasoning?: boolean | null
 }
 
 /**
@@ -190,8 +242,7 @@ export interface ModelSlotRequest {
  * the defaults.
  */
 export interface SetupRequest {
-  medium: ModelSlotRequest
-  large: ModelSlotRequest
+  chat: ModelSlotRequest
   image: ModelSlotRequest
   /** Optional asset-generation credentials (blank = unchanged). */
   tencentSecretId?: string
@@ -284,7 +335,7 @@ export type ExportProgress =
   | { phase: 'done'; message?: string }
 
 /**
- * A code file with a parsed `#=== genieengine ===` header block (the format the
+ * A code file with a parsed `#=== solar ===` header block (the format the
  * injected agent instructions mandate for every file the AI writes — see
  * resources/agent-instructions.md). Backs the ECS viewer in the center pane.
  */
@@ -347,8 +398,30 @@ export type GameInputEvent =
   | { type: 'focus' }
   | { type: 'blur' }
 
+export type SceneEditorState =
+  | { status: 'idle' | 'opening' }
+  | { status: 'ready'; mode: 'child' | 'owned'; backend?: 'libgodot' | 'executable' }
+  | { status: 'error'; message: string }
+
+export type SceneEditorAction = '2d' | '3d' | 'focus'
+
 /** The API the preload script exposes on `window.api`. */
-export interface GenieEngineApi {
+export interface SolarApi {
+  assetLibrary(): Promise<Result<import('./asset-library').LibraryEntry[]>>
+  assetSearch(query: import('./asset-library').AssetQuery): Promise<Result<import('./asset-library').AssetMatch[]>>
+  assetInstall(packId: string): Promise<Result<import('./asset-library').LibraryEntry>>
+  assetImportArchive(packId: string): Promise<Result<import('./asset-library').LibraryEntry | null>>
+  assetInstallAddon(packId: string, projectPath: string): Promise<Result<string>>
+  onAssetLibraryChanged(cb: () => void): () => void
+  productionSettings(): Promise<Result<import('./production').ProductionSettings>>
+  productionConfigure(enabled: boolean): Promise<Result<import('./production').ProductionSettings>>
+  productionState(): Promise<Result<import('./production').ProductionState | null>>
+  productionPrepareProject(): Promise<Result<null>>
+  studioReadiness(verifyConnections?: boolean): Promise<Result<import('./production').StudioReadiness>>
+  productionResume(runId: string): Promise<Result<null>>
+  productionApprove(runId: string, operationId: string, approved: boolean): Promise<Result<null>>
+  productionRevealEvidence(runId: string, evidenceId: string): Promise<Result<null>>
+  onProductionState(cb: (state: import('./production').ProductionState) => void): () => void
   platform: string
 
   // App / project lifecycle
@@ -389,9 +462,17 @@ export interface GenieEngineApi {
   /** Measured game frame rate, ~1 update/second while a game runs. */
   onGameFps(cb: (fps: number) => void): () => void
 
+  // Native Godot scene workspace (Windows)
+  openSceneEditor(): Promise<Result<null>>
+  closeSceneEditor(): Promise<Result<null>>
+  getSceneEditorState(): Promise<Result<SceneEditorState>>
+  sceneEditorAction(action: SceneEditorAction): Promise<Result<null>>
+  setSceneEditorBounds(rect: StageRect): void
+  setSceneEditorVisible(visible: boolean): void
+  onSceneEditorState(cb: (state: SceneEditorState) => void): () => void
+
   // AI chat (OpenCode)
-  /** `tier` picks which chat model answers; the conversation continues either way. */
-  chatSend(message: string, attachments?: ChatAttachment[], tier?: ChatModelTier): Promise<Result<null>>
+  chatSend(message: string, attachments?: ChatAttachment[]): Promise<Result<null>>
   /**
    * Absolute disk path of a picked/dropped File (Electron webUtils) — '' when
    * it has none (e.g. a File synthesized in the page). Synchronous.
@@ -419,10 +500,19 @@ export interface GenieEngineApi {
   /** Dismiss a pending question (the assistant is told and continues without answers). */
   chatRejectQuestion(requestID: string): Promise<Result<null>>
   getSetupStatus(): Promise<Result<SetupStatus>>
+  /** Apply a reasoning level to the current chat model and reload OpenCode. */
+  setChatReasoningEffort(effort: ReasoningEffort): Promise<Result<SetupStatus>>
   /** Credential fields left blank = leave that provider's setup unchanged. */
   saveSetup(request: SetupRequest): Promise<Result<SetupStatus>>
+  /** Fetches model IDs for a provider without generating a model response. */
+  listModelIds(request: ModelCatalogRequest): Promise<Result<ModelCatalogItem[]>>
+  /** Copy selected legacy API entries into the encrypted vault and remove them from shared auth.json. */
+  migrateLegacyOpenCodeCredentials(providerIds: string[]): Promise<Result<SetupStatus>>
+  /** Restore the shared auth.json snapshot if it has not changed since migration. */
+  restoreLegacyOpenCodeAuthBackup(backupId: string): Promise<Result<SetupStatus>>
   onChatPart(cb: (part: ChatPartUpdate) => void): () => void
   onChatDone(cb: (payload: ChatDonePayload) => void): () => void
+  onChatConnection(cb: (state: import('./connection-recovery').ChatConnectionState) => void): () => void
   /** A generated 2D/3D asset preview to render in the chat (user can give feedback). */
   onAssetPreview(cb: (preview: AssetPreview) => void): () => void
   /** Fired (debounced) when the AI edits project files during a response. */
@@ -444,7 +534,9 @@ export interface GenieEngineApi {
   // Files
   listDir(path: string): Promise<Result<FileEntry[]>>
   openInVSCode(target?: string): Promise<Result<null>>
-  openInGodotEditor(): Promise<Result<null>>
+  /** True when launched; false when already running for the current project. */
+  openInGodotEditor(recoveryMode?: boolean): Promise<Result<boolean>>
+  onGodotEditorFailure(cb: (failure: { projectPath: string; message: string; recoveryMode: boolean }) => void): () => void
 
   // Git
   gitStatus(): Promise<Result<GitStatus>>

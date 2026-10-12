@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ExportPlatform, ExportProgress } from '../../../shared/types'
 import { AndroidIcon, AppleIcon, CheckIcon, GlobeIcon, LinuxIcon, WindowsIcon, XIcon } from './Icons'
 
@@ -20,8 +20,11 @@ type PlatformState = { status: 'idle' | 'exporting' | 'success' | 'error'; messa
 
 export function ExportModal({ projectName, onClose }: Props): React.JSX.Element {
   const [name, setName] = useState(projectName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'game')
-  const [selected, setSelected] = useState<Set<ExportPlatform>>(new Set(['macos']))
+  const [selected, setSelected] = useState<Set<ExportPlatform>>(() => new Set([
+    window.api.platform === 'win32' ? 'windows' : window.api.platform === 'darwin' ? 'macos' : 'linux'
+  ]))
   const [running, setRunning] = useState(false)
+  const pending = useRef(false)
   const [templates, setTemplates] = useState<{ message: string; percent: number } | null>(null)
   const [states, setStates] = useState<Partial<Record<ExportPlatform, PlatformState>>>({})
   const [doneMessage, setDoneMessage] = useState<string | null>(null)
@@ -38,6 +41,10 @@ export function ExportModal({ projectName, onClose }: Props): React.JSX.Element 
           setTemplates(null)
           setRunning(false)
           setDoneMessage(update.message ?? null)
+          setStates((prev) => Object.fromEntries(Object.entries(prev).map(([platform, state]) => [
+            platform,
+            state.status === 'exporting' ? { status: 'error', message: update.message ?? 'Export did not complete.' } : state
+          ])))
         }
       }),
     []
@@ -54,14 +61,19 @@ export function ExportModal({ projectName, onClose }: Props): React.JSX.Element 
   }
 
   const start = async (): Promise<void> => {
-    if (running || selected.size === 0) return
+    if (pending.current || selected.size === 0) return
+    pending.current = true
     setRunning(true)
     setDoneMessage(null)
     setStates(Object.fromEntries([...selected].map((id) => [id, { status: 'idle' as const }])))
-    const result = await window.api.exportGame(name, [...selected])
-    if (!result.ok) {
+    try {
+      const result = await window.api.exportGame(name, [...selected])
+      if (!result.ok) setDoneMessage(result.error)
+    } catch (err) {
+      setDoneMessage(err instanceof Error ? err.message : String(err))
+    } finally {
+      pending.current = false
       setRunning(false)
-      setDoneMessage(result.error)
     }
   }
 
@@ -147,7 +159,7 @@ export function ExportModal({ projectName, onClose }: Props): React.JSX.Element 
                 <>
                   exported.{' '}
                   <button className="link-btn" onClick={() => void window.api.revealExport(s.message!)}>
-                    Reveal in Finder
+                    Show in folder
                   </button>
                 </>
               ) : (

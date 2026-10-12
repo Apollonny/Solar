@@ -47,10 +47,12 @@ interface ParsedHeader {
   extra: string[]
 }
 
-/** Parse the first `#=== genieengine ===` … `#=== /genieengine ===` block. */
+/** Read Solar headers while retaining legacy project headers. */
 function parseHeader(src: string, comment: string): ParsedHeader | null {
   const esc = comment.replace(/\//g, '\\/')
-  const block = new RegExp(`^${esc}=== genieengine ===[ \\t]*\\r?\\n([\\s\\S]*?)^${esc}=== \\/genieengine ===`, 'm').exec(src)
+  const block = ['solar', 'genieengine']
+    .map((brand) => new RegExp(`^${esc}=== ${brand} ===[ \\t]*\\r?\\n([\\s\\S]*?)^${esc}=== \\/${brand} ===`, 'm').exec(src))
+    .find((match) => match !== null)
   if (!block) return null
   const fields: Record<string, string> = {}
   const extra: string[] = []

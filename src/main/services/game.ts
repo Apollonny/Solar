@@ -1,9 +1,12 @@
 import { app, screen, type BrowserWindow } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdir, realpath, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { GameInputEvent, GameState, StageRect } from '../../shared/types'
+import { AGENT_BUDGET } from '../../shared/agent-budget'
 import { getMainWindow, sendToRenderer } from '../window'
-import { resolveGodot } from './binaries'
+import { resolveEmbeddedGodot, resolveGodot } from './binaries'
 import { EmbedSession, NOTIFICATION, WIN_EVENT } from './godot-embed'
 import {
   domButtonsToGodotMask,
@@ -19,22 +22,21 @@ import {
   type MouseMotionInput
 } from './godot-input-codec'
 import { addPerfFrames, appendPerfLog, drainPerfWindow, formatPerfStats, resetPerfWindow, type PerfStats } from './perf-monitor'
-import { cleanupTestAgent, injectTestAgent } from './test-agent'
+import { cleanupTestAgent, cleanupTestAgentSync, injectTestAgent } from './test-agent'
 import { windowHandleArg, winhost, type WinHost } from './winhost'
 
 /**
  * Runs the user's game with the full desktop engine, rendered *inside* the
- * GenieEngine window. Uses Godot 4.6+'s embedded display server (the same
+ * Solar window. Uses Godot 4.6+'s embedded display server (the same
  * mechanism the Godot editor uses for its in-editor game view on macOS): the
  * game process renders into a cross-process CoreAnimation context, which we
  * composite via the layerhost native addon; display state and input travel
  * over Godot's debugger protocol. Works in fullscreen — it's just a layer in
  * our window. AI test runs use the same pipeline without attaching the layer.
  *
- * Godot's embedded display server is macOS-ONLY. On Windows the game is
- * embedded the way the Godot editor does it there: launched with `--wid` so
- * its borderless window is OWNED by ours, then kept glued over the stage by
- * winhost.ts (SetWindowPos via FFI) — input reaches it directly from the OS.
+ * Godot's embedded display server is macOS-ONLY. On Windows Solar's pinned
+ * Godot build creates a native child of the main window for visible game
+ * runs. The OS moves it with Solar and routes input to it directly.
  * Anywhere else (Linux, embedding unavailable) the game falls back to running
  * in its own free-floating OS window. The debugger channel and the injected
  * test agent are platform-independent, so AI test runs (screenshots, eval,
@@ -45,6 +47,27 @@ import { windowHandleArg, winhost, type WinHost } from './winhost'
 
 let state: GameState = { status: 'stopped' }
 let nativeProcess: ChildProcess | null = null
+const godotEditors = new Map<string, ChildProcess>()
+const godotEditorStarts = new Map<string, Promise<boolean>>()
+// Startup touches project files before a ChildProcess exists. Serialize that
+// preparation so a cancelled launch cannot race a new launch's autoload and
+// override.cfg injection.
+let gameLaunchTail: Promise<void> = Promise.resolve()
+let gameRunEpoch = 0
+
+function serializeGameLaunch<T>(launch: () => Promise<T>): Promise<T> {
+  const previous = gameLaunchTail
+  let release!: () => void
+  gameLaunchTail = new Promise<void>((resolve) => { release = resolve })
+  return (async () => {
+    await previous
+    try {
+      return await launch()
+    } finally {
+      release()
+    }
+  })()
+}
 
 // Native embedded-session state
 let embedSession: EmbedSession | null = null
@@ -88,7 +111,7 @@ const pendingTestReplies = new Map<
  * Starting a new run_game_test resets the budget — deliberate: a fresh run
  * restarts the game, so it can't be farmed to extend one endless session.
  */
-const TEST_BUDGET = { calls: 40, ms: 8 * 60_000, warnCalls: 30, warnMs: 6 * 60_000 }
+const TEST_BUDGET = AGENT_BUDGET.gameTest
 let testToolCalls = 0
 let testRunStart = 0
 
@@ -153,28 +176,31 @@ function emitLog(line: string): void {
   }
 }
 
-function pipeLines(stream: NodeJS.ReadableStream | null): void {
+function pipeLines(stream: NodeJS.ReadableStream | null, isCurrent: () => boolean): void {
   if (!stream) return
   let buffer = ''
   stream.setEncoding('utf8')
   stream.on('data', (chunk: string) => {
+    if (!isCurrent()) return
     buffer += chunk
     const lines = buffer.split('\n')
     buffer = lines.pop() ?? ''
     lines.forEach(emitLog)
   })
-  stream.on('end', () => emitLog(buffer))
+  stream.on('end', () => { if (isCurrent()) emitLog(buffer) })
 }
 
 /**
  * Record a completed 60s frame-rate window: into the game console/log buffer
- * (so the AI's game_logs tool sees it) and the project's .genieengine/perf.log
+ * (so the AI's game_logs tool sees it) and the project's .solar/perf.log
  * (persistent history for diagnosing performance across runs).
  */
 function logPerfStats(stats: PerfStats): void {
-  emitLog(`[genieengine] fps ${formatPerfStats(stats)} — history in .genieengine/perf.log`)
+  emitLog(`[solar] fps ${formatPerfStats(stats)} — history in .solar/perf.log`)
   if (injectedProjectPath) {
-    void appendPerfLog(injectedProjectPath, state.mode ?? 'native', stats)
+    void appendPerfLog(injectedProjectPath, state.mode ?? 'native', stats).catch((err) => {
+      emitLog(`[solar] could not save the FPS log: ${err instanceof Error ? err.message : String(err)}`)
+    })
   }
 }
 
@@ -187,7 +213,7 @@ function handlePerfFrames(deltas: number[]): void {
 
 function godotMissingError(): Error {
   return new Error(
-    'The bundled Godot engine is missing. Reinstall GenieEngine (or run `npm run setup` in development), or locate a Godot binary manually.'
+    'The bundled Godot engine is missing. Reinstall Solar (or run `npm run setup` in development), or locate a Godot binary manually.'
   )
 }
 
@@ -219,25 +245,22 @@ function layerhost(): LayerHostAddon | null {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     layerHostAddon = require(path) as LayerHostAddon
   } catch (err) {
-    console.error('[genieengine] failed to load layerhost addon:', err)
+    console.error('[solar] failed to load layerhost addon:', err)
     layerHostAddon = null
   }
   return layerHostAddon
 }
 
 // ---------------------------------------------------------------------------
-// Windows owned-window embedding (winhost.ts)
+// Windows native child-window embedding (winhost.ts)
 // ---------------------------------------------------------------------------
 //
-// Windows equivalent of the layer host, porting the Godot editor's in-editor
-// game view (display_server_windows.cpp embed_process, Godot 4.7): the game
-// is launched with `--wid <our HWND>`, which makes the engine create its
-// window borderless and OWNED by ours — owned windows always float above
-// their owner — and winhost keeps that window glued to the stage rect with
-// SetWindowPos. The OS routes input to the game window directly, so unlike
-// macOS no input forwarding happens.
+// Windows equivalent of the layer host: Solar's pinned Godot build creates a
+// Vulkan game window as a native child of the main HWND. The OS moves it with
+// Solar; winhost only adjusts its size when the stage layout changes.
+// Windows routes input to the game window directly.
 
-// Owned-window embed session state (play mode only; test runs stay external).
+// Native child-window embed session state (play mode only).
 let winAttached = false
 let winAttachPoll: ReturnType<typeof setInterval> | null = null
 let trackedWin: BrowserWindow | null = null
@@ -266,14 +289,13 @@ function updateWinEmbedFrame(): void {
   addon.setFrame(r.x, r.y, r.width, r.height)
 }
 
-// The embedded window sits at an absolute screen position, so dragging or
-// resizing the GenieEngine window must re-glue it (stage-rect reports from the
-// renderer only cover layout changes INSIDE the window).
+// The native child follows window movement without a JavaScript correction.
+// A resize still changes the stage dimensions and needs one bounds update.
 const onHostWindowMoved = (): void => updateWinEmbedFrame()
 
 function trackHostWindow(win: BrowserWindow): void {
   trackedWin = win
-  win.on('move', onHostWindowMoved)
+  if (!winhost()?.isChildEmbedded()) win.on('move', onHostWindowMoved)
   win.on('resize', onHostWindowMoved)
 }
 
@@ -291,17 +313,14 @@ function stopWinAttachPoll(): void {
 }
 
 /**
- * Poll for the game's owned window (created shortly after launch thanks to
- * --wid) and glue it to the stage. Mirrors the Godot editor's EmbeddedProcess
- * retry timer: tick until found, with the same generous 45s timeout — first
- * boots of heavy projects can take a long time to open a window. Falls back
- * to free-floating play if embedding never succeeds.
+ * Wait for the game's child window after Godot starts. Heavy projects can take
+ * time to open their first window; an unavailable child remains external.
  */
 function beginWinEmbedAttach(session: EmbedSession, win: BrowserWindow, addon: WinHost, pid: number): void {
   const deadline = Date.now() + 45000
   const giveUp = (why: string): void => {
     stopWinAttachPoll()
-    emitLog(`[genieengine] window embedding unavailable (${why}) — the game plays in its own window`)
+    emitLog(`[solar] window embedding unavailable (${why}) — the game plays in its own window`)
     setState({ status: 'running', mode: 'native', view: 'external' })
   }
   const tick = (): void => {
@@ -320,10 +339,14 @@ function beginWinEmbedAttach(session: EmbedSession, win: BrowserWindow, addon: W
       return
     }
     if (attached) {
+      if (!addon.isChildEmbedded()) {
+        giveUp('Godot did not create a native child window')
+        return
+      }
       stopWinAttachPoll()
       winAttached = true
       trackHostWindow(win)
-      emitLog('[genieengine] game embedded over the GenieEngine window (native, full performance)')
+      emitLog('[solar] game embedded over the Solar window (native, full performance)')
       setState({ status: 'running', mode: 'native', view: 'embedded-window' })
     } else if (Date.now() > deadline) {
       giveUp('game window not found')
@@ -398,7 +421,7 @@ function updateTestMonitorLayer(): void {
   } catch (err) {
     // The run works without the live view — don't let a compositing failure
     // take down the test session.
-    emitLog(`[genieengine] live test monitor unavailable: ${err instanceof Error ? err.message : String(err)}`)
+    emitLog(`[solar] live test monitor unavailable: ${err instanceof Error ? err.message : String(err)}`)
   }
 }
 
@@ -522,24 +545,26 @@ function handleWheel(event: Extract<GameInputEvent, { type: 'wheel' }>): void {
  *    off-screen (the game still renders on the GPU — screenshots and probes
  *    work). Test runs embed without the layerhost addon (no layer to attach);
  *    visible runs need it to composite the game into our window.
- *  - Windows: Godot's --wid owned-window embedding + the winhost glue, for
- *    visible play only (test runs have nothing to gain from being glued over
- *    the stage).
- *  - Anywhere else (Linux, failed addon/FFI loads, GENIEENGINE_WINDOWED=1
+ *  - Windows: Solar's Vulkan child-window Godot build for visible play only.
+ *  - Anywhere else (Linux, failed addon/FFI loads, SOLAR_WINDOWED=1
  *    which forces this path for debugging): the game plays in its own OS
  *    window over the same debug channel.
  */
-async function playNativeEmbedded(godot: string, projectPath: string, visible: boolean): Promise<void> {
+async function playNativeEmbedded(godot: string, projectPath: string, visible: boolean, runEpoch: number): Promise<void> {
   const win = getMainWindow()
   if (!win) throw new Error('Main window unavailable')
+  const isCurrentRun = (): boolean => gameRunEpoch === runEpoch
   const addon = layerhost()
-  const forceWindowed = Boolean(process.env.GENIEENGINE_WINDOWED)
+  const forceWindowed = Boolean(process.env.SOLAR_WINDOWED ?? process.env.GENIEENGINE_WINDOWED)
   const embedded = process.platform === 'darwin' && !forceWindowed && (!visible || addon !== null)
-  const winHost = !embedded && !forceWindowed && visible && process.platform === 'win32' ? winhost() : null
+  const availableWinHost = !embedded && !forceWindowed && visible && process.platform === 'win32' ? winhost() : null
+  const embeddedGodot = availableWinHost ? await resolveEmbeddedGodot() : null
+  const winHost = embeddedGodot ? availableWinHost : null
   embeddedRun = embedded
 
   const session = new EmbedSession({
     onContextId: (contextId) => {
+      if (!isCurrentRun() || embedSession !== session) return
       // Configure the game's display *after* its embedded display server is
       // up (this message is our signal): with the default state the GL
       // manager has no valid display id and presents nothing but black.
@@ -552,10 +577,10 @@ async function playNativeEmbedded(godot: string, projectPath: string, visible: b
         // attach() shows the layer; honor the renderer's requested visibility
         // in case a modal opened before the game finished launching.
         if (!layerVisibleWanted) addon!.setVisible(false)
-        emitLog('[genieengine] game embedded in the GenieEngine window (native, full performance)')
+        emitLog('[solar] game embedded in the Solar window (native, full performance)')
         setState({ status: 'running', mode: 'native', view: 'embedded' })
       } else {
-        emitLog('[genieengine] game running off-screen for an AI test run')
+        emitLog('[solar] game running off-screen for an AI test run')
         testContextId = contextId
         testGameSize = { width: rect.width, height: rect.height }
         // The monitor box may already be on screen (e.g. a second test run in
@@ -567,10 +592,12 @@ async function playNativeEmbedded(godot: string, projectPath: string, visible: b
       session.sendNotification(NOTIFICATION.APPLICATION_FOCUS_IN)
       session.sendWinEvent(WIN_EVENT.FOCUS_IN)
     },
-    onCursorShape: (shape) => sendToRenderer('game:cursor', shape),
+    onCursorShape: (shape) => {
+      if (isCurrentRun() && embedSession === session) sendToRenderer('game:cursor', shape)
+    },
     onDisconnect: () => {
       // Game went away (quit/crash) — tear down if the process exit hasn't already.
-      if (state.status !== 'stopped') stopGame()
+      if (isCurrentRun() && embedSession === session && state.status !== 'stopped') stopGame()
     },
     onTestReply: (id, ok, text) => {
       const pending = pendingTestReplies.get(id)
@@ -585,6 +612,10 @@ async function playNativeEmbedded(godot: string, projectPath: string, visible: b
 
   resetPerfWindow()
   const port = await session.listen()
+  if (!isCurrentRun()) {
+    session.close()
+    return
+  }
   embedSession = session
 
   const args = ['--path', projectPath]
@@ -593,59 +624,72 @@ async function playNativeEmbedded(godot: string, projectPath: string, visible: b
     // a window; only the macOS display server implements it.
     args.push('--embedded')
   } else if (winHost) {
-    // --wid makes the engine create its window borderless, locked to windowed
-    // mode, and OWNED by ours (Godot's Windows equivalent of --embedded; see
-    // editor/run/game_view_plugin.cpp). --position/--resolution pre-place it
-    // over the stage so it doesn't flash at the project's default position
-    // before winhost picks it up. --position is in Godot screen space:
-    // physical px relative to the virtual desktop's top-left-most corner.
+    // The source-built Godot checks this exact --wid handle before creating a
+    // WS_CHILD window. Vulkan is required for visible native child rendering
+    // under Electron on the tested Windows driver.
     const rect = stageRect ?? { x: 0, y: 0, width: 640, height: 360 }
     const sr = stageScreenRect(win, rect)
     const origin = winHost.virtualScreenOrigin()
     args.push('--wid', windowHandleArg(win))
     args.push('--position', `${sr.x - origin.x},${sr.y - origin.y}`)
     args.push('--resolution', `${sr.width}x${sr.height}`)
+    args.push('--rendering-driver', 'vulkan')
   }
   args.push('--remote-debug', `tcp://127.0.0.1:${port}`, '--skip-breakpoints')
 
-  const proc = spawn(godot, args, {
+  const proc = spawn(winHost ? embeddedGodot! : godot, args, {
     cwd: projectPath,
-    env: { ...process.env, PWD: projectPath },
+    env: {
+      ...process.env,
+      PWD: projectPath,
+      ...(winHost ? {
+        SOLAR_GODOT_CHILD_PARENT: windowHandleArg(win),
+        SOLAR_GODOT_HELPER_EXECUTABLE: ''
+      } : {})
+    },
     stdio: ['ignore', 'pipe', 'pipe']
   })
   await new Promise<void>((resolve, reject) => {
     proc.once('spawn', resolve)
     proc.once('error', reject)
   })
+  // Stop/project-switch may happen while Node is waiting for the OS spawn
+  // event. The stopping path could not see this process yet, so retire it here
+  // before exposing it as the active run.
+  if (!isCurrentRun() || embedSession !== session) {
+    session.close()
+    if (proc.exitCode === null && proc.signalCode === null) proc.kill()
+    return
+  }
   nativeProcess = proc
-  pipeLines(proc.stdout)
-  pipeLines(proc.stderr)
+  pipeLines(proc.stdout, isCurrentRun)
+  pipeLines(proc.stderr, isCurrentRun)
 
   if (!embedded) {
     // No embedded display server → no game_view:set_context_id handshake; the
     // debug connection itself is the "game is up" signal. (The game connects
     // well after this synchronous block, so the assignment can't be late.)
     session.onConnected = () => {
+      if (!isCurrentRun() || embedSession !== session) return
       if (winHost && proc.pid) {
-        // Windows: the game window (owned by ours thanks to --wid) is created
-        // around now — find it and glue it over the stage.
+        // Windows: find the game HWND created as a native Solar child.
         beginWinEmbedAttach(session, win, winHost, proc.pid)
       } else if (visible) {
-        emitLog('[genieengine] game running in its own window (in-app game view is unavailable on this platform)')
+        emitLog('[solar] game running in its own window (in-app game view is unavailable on this platform)')
         setState({ status: 'running', mode: 'native', view: 'external' })
       } else {
-        emitLog('[genieengine] game running in a separate window for an AI test run')
+        emitLog('[solar] game running in a separate window for an AI test run')
         setState({ status: 'running', mode: 'test', liveView: false, view: 'external' })
       }
     }
   }
   proc.once('exit', (code, signal) => {
-    emitLog(`[genieengine] game exited (${signal ?? `code ${code ?? 0}`})`)
     // Only tear down if this process is still the active run. After a Stop,
     // the old process exits up to 1.5s later (grace period before kill); by
     // then a new run may own nativeProcess/embedSession, and tearing down
     // here would kill that new run.
     if (nativeProcess !== proc) return
+    emitLog(`[solar] game exited (${signal ?? `code ${code ?? 0}`})`)
     nativeProcess = null
     stopGame()
   })
@@ -657,25 +701,50 @@ async function playNativeEmbedded(godot: string, projectPath: string, visible: b
 
 export async function playGame(projectPath: string): Promise<void> {
   if (state.status !== 'stopped') throw new Error('The game is already running')
-  const godot = await resolveGodot()
-  if (!godot) throw godotMissingError()
-
+  const runEpoch = ++gameRunEpoch
   setState({ status: 'starting' })
-  try {
-    // The agent also runs during user play — it supplies the frame timings
-    // behind the FPS counter and .genieengine/perf.log (probe commands stay
-    // test-only: runTestCommand refuses outside test mode).
-    await cleanupTestAgent(projectPath) // stale files from a crashed run
-    await injectTestAgent(projectPath)
-    injectedProjectPath = projectPath
-    await playNativeEmbedded(godot, projectPath, true)
-  } catch (err) {
-    stopGame()
-    throw err
-  }
+  return serializeGameLaunch(async () => {
+    try {
+      const godot = await resolveGodot()
+      if (!isCurrentGameRun(runEpoch)) return
+      if (!godot) throw godotMissingError()
+
+      // The agent also runs during user play — it supplies the frame timings
+      // behind the FPS counter and .solar/perf.log (probe commands stay
+      // test-only: runTestCommand refuses outside test mode).
+      await cleanupTestAgent(projectPath) // stale files from a crashed run
+      if (!isCurrentGameRun(runEpoch)) return
+      await injectTestAgent(projectPath)
+      if (!isCurrentGameRun(runEpoch)) {
+        await cleanupTestAgent(projectPath)
+        return
+      }
+      injectedProjectPath = projectPath
+      await playNativeEmbedded(godot, projectPath, true, runEpoch)
+      // A spawned process can fail to connect or create its viewport. Do not leave Run stuck forever.
+      const deadline = Date.now() + 60000
+      while (getGameState().status === 'starting' && Date.now() < deadline && isCurrentGameRun(runEpoch)) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      if (isCurrentGameRun(runEpoch) && getGameState().status !== 'running') {
+        throw new Error('The game could not start within 60 seconds. Check the output for Godot errors.')
+      }
+    } catch (err) {
+      if (!isCurrentGameRun(runEpoch)) return
+      stopGame()
+      throw err
+    }
+  })
+}
+
+function isCurrentGameRun(runEpoch: number): boolean {
+  return gameRunEpoch === runEpoch
 }
 
 export function stopGame(): void {
+  // Invalidate startup tasks as well as the active process. In particular, a
+  // queued launch must not resume after Stop or after switching projects.
+  gameRunEpoch++
   // Flush the in-progress stats window first (needs mode + project path, both
   // still set here); short leftovers are dropped inside drainPerfWindow.
   const finalStats = drainPerfWindow()
@@ -683,7 +752,7 @@ export function stopGame(): void {
   if (nativeProcess) {
     // Ask the game to close cleanly (saves etc.); force-kill if it lingers.
     // Each presentation has its own close channel: the embedded display
-    // server takes a close win-event, the owned window takes WM_CLOSE (what
+    // server takes a close win-event, the native child takes WM_CLOSE (what
     // the Godot editor posts), and plain windowed runs fall back to the
     // injected agent quitting the scene tree.
     const proc = nativeProcess
@@ -715,7 +784,11 @@ export function stopGame(): void {
   }
   pendingTestReplies.clear()
   if (injectedProjectPath) {
-    void cleanupTestAgent(injectedProjectPath)
+    try {
+      cleanupTestAgentSync(injectedProjectPath)
+    } catch (err) {
+      emitLog(`[solar] could not clean temporary Godot files: ${err instanceof Error ? err.message : String(err)}`)
+    }
     injectedProjectPath = null
   }
   if (state.status !== 'stopped') setState({ status: 'stopped' })
@@ -730,32 +803,44 @@ export async function startGameTest(projectPath: string): Promise<void> {
   if (state.status !== 'stopped') {
     throw new Error('A game is already running. Stop it first (stop_game_test or the Stop button).')
   }
-  const godot = await resolveGodot()
-  if (!godot) throw godotMissingError()
-
+  const runEpoch = ++gameRunEpoch
   logBuffer.length = 0
   testToolCalls = 0
   testRunStart = Date.now()
   setState({ status: 'starting', mode: 'test' })
-  try {
-    await cleanupTestAgent(projectPath) // stale files from a crashed run
-    await injectTestAgent(projectPath)
-    injectedProjectPath = projectPath
-    await playNativeEmbedded(godot, projectPath, false)
-    // Wait until the handshake completes (state flips to running) so tools
-    // called right after run_game_test find a live session. Read via the
-    // accessor: `state` is mutated from event callbacks TS can't see.
-    const deadline = Date.now() + 15000
-    while (getGameState().status === 'starting' && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100))
+  return serializeGameLaunch(async () => {
+    try {
+      const godot = await resolveGodot()
+      if (!isCurrentGameRun(runEpoch)) return
+      if (!godot) throw godotMissingError()
+
+      await cleanupTestAgent(projectPath) // stale files from a crashed run
+      if (!isCurrentGameRun(runEpoch)) return
+      await injectTestAgent(projectPath)
+      if (!isCurrentGameRun(runEpoch)) {
+        await cleanupTestAgent(projectPath)
+        return
+      }
+      injectedProjectPath = projectPath
+      await playNativeEmbedded(godot, projectPath, false, runEpoch)
+      if (!isCurrentGameRun(runEpoch)) return
+      // Wait until the handshake completes (state flips to running) so tools
+      // called right after run_game_test find a live session. Read via the
+      // accessor: `state` is mutated from event callbacks TS can't see.
+      const deadline = Date.now() + 15000
+      while (getGameState().status === 'starting' && Date.now() < deadline && isCurrentGameRun(runEpoch)) {
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      if (!isCurrentGameRun(runEpoch)) return
+      if (getGameState().status !== 'running') {
+        throw new Error('The game did not reach a running state — check game_logs for errors.')
+      }
+    } catch (err) {
+      if (!isCurrentGameRun(runEpoch)) return
+      stopGame()
+      throw err
     }
-    if (getGameState().status !== 'running') {
-      throw new Error('The game did not reach a running state — check game_logs for errors.')
-    }
-  } catch (err) {
-    stopGame()
-    throw err
-  }
+  })
 }
 
 /** Send a probe command to the injected test agent and await its reply. */
@@ -839,9 +924,115 @@ export async function runTestInput(actions: TestInputAction[]): Promise<void> {
   }
 }
 
-export async function openGodotEditor(projectPath: string): Promise<void> {
+async function waitForGameExit(proc: ChildProcess): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      proc.removeListener('exit', onExit)
+      reject(new Error('The game preview did not close. Stop it before opening Godot Editor.'))
+    }, 4000)
+    const onExit = (): void => {
+      clearTimeout(timer)
+      resolve()
+    }
+    proc.once('exit', onExit)
+  })
+}
+
+async function launchGodotEditor(projectPath: string, projectKey: string, requestedProjectPath: string, recoveryMode: boolean): Promise<boolean> {
+  if (state.status === 'starting') {
+    throw new Error('The game preview is still starting. Wait for it to finish before opening Godot Editor.')
+  }
+  if (state.status !== 'stopped') {
+    const game = nativeProcess
+    stopGame()
+    if (game) await waitForGameExit(game)
+  }
+  // A terminated preview or app crash can leave Solar's temporary autoload
+  // behind. Godot's editor must see the user's own project configuration.
+  await cleanupTestAgent(projectPath)
+
+  const existing = godotEditors.get(projectKey)
+  if (existing && existing.exitCode === null && existing.signalCode === null) return false
+
   const godot = await resolveGodot()
   if (!godot) throw godotMissingError()
-  // Detached so the editor outlives GenieEngine if the user quits.
-  spawn(godot, ['--editor', '--path', projectPath], { detached: true, stdio: 'ignore' }).unref()
+  const logDir = join(app.getPath('userData'), 'logs')
+  await mkdir(logDir, { recursive: true })
+  const logPath = join(logDir, `godot-editor-${createHash('sha256').update(projectKey).digest('hex').slice(0, 12)}.log`)
+  const args = ['--editor', '--path', projectPath, '--log-file', logPath]
+  if (recoveryMode) args.push('--recovery-mode')
+  // Detached so the editor remains open if Solar exits. A short observation
+  // window catches startup crashes that the OS spawn event alone misses.
+  const editor = spawn(godot, args, { cwd: projectPath, detached: true, stdio: 'ignore' })
+  godotEditors.set(projectKey, editor)
+  let startupConfirmed = false
+  let handedOff = false
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      let settled = false
+      const finish = (err?: Error): void => {
+        if (settled) return
+        settled = true
+        if (timer) clearTimeout(timer)
+        if (err) reject(err)
+        else {
+          startupConfirmed = true
+          resolve()
+        }
+      }
+      editor.once('spawn', () => {
+        timer = setTimeout(() => finish(), 3000)
+      })
+      editor.once('exit', (code, signal) => {
+        if (godotEditors.get(projectKey) === editor) godotEditors.delete(projectKey)
+        const detail = `Godot Editor closed ${signal ? `after signal ${signal}` : `with code ${code ?? 'unknown'}`}. Log: ${logPath}`
+        if (!startupConfirmed && code === 0 && !signal) {
+          handedOff = true
+          finish()
+        } else if (!startupConfirmed) finish(new Error(detail))
+        else if (code !== 0 || signal) {
+          sendToRenderer('files:godotEditorFailure', { projectPath: requestedProjectPath, message: detail, recoveryMode })
+        }
+      })
+      editor.once('error', (err) => {
+        if (godotEditors.get(projectKey) === editor) godotEditors.delete(projectKey)
+        const message = `Could not start Godot Editor at "${godot}": ${err.message}`
+        if (!startupConfirmed) finish(new Error(message))
+        else sendToRenderer('files:godotEditorFailure', { projectPath: requestedProjectPath, message, recoveryMode })
+      })
+    })
+  } catch (err) {
+    if (godotEditors.get(projectKey) === editor) godotEditors.delete(projectKey)
+    throw err
+  }
+  editor.unref()
+  return !handedOff
+}
+
+export async function openGodotEditor(projectPath: string, recoveryMode = false): Promise<boolean> {
+  let canonicalProjectPath: string
+  try {
+    canonicalProjectPath = await realpath(projectPath)
+  } catch {
+    throw new Error(`Cannot find the project folder: ${projectPath}`)
+  }
+  try {
+    const projectConfig = await stat(join(canonicalProjectPath, 'project.godot'))
+    if (!projectConfig.isFile()) throw new Error('project.godot is not a file')
+  } catch {
+    throw new Error(`This folder is not a Godot project (project.godot is missing): ${canonicalProjectPath}`)
+  }
+
+  const projectKey = process.platform === 'win32' ? canonicalProjectPath.toLowerCase() : canonicalProjectPath
+  const pending = godotEditorStarts.get(projectKey)
+  if (pending) return pending
+  const launch = launchGodotEditor(canonicalProjectPath, projectKey, projectPath, recoveryMode)
+  godotEditorStarts.set(projectKey, launch)
+  try {
+    return await launch
+  } finally {
+    if (godotEditorStarts.get(projectKey) === launch) godotEditorStarts.delete(projectKey)
+  }
 }

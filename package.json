@@ -1,6 +1,6 @@
 {
-  "name": "genieengine",
-  "productName": "GenieEngine",
+  "name": "solar",
+  "productName": "Solar",
   "version": "0.1.2",
   "description": "AI-powered game engine — build games by chatting with an AI, powered by Godot under the hood.",
   "main": "out/main/index.js",
@@ -11,11 +11,25 @@
     "setup": "node scripts/fetch-vendor.mjs && node scripts/build-native.mjs",
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "build:libgodot": "node scripts/build-libgodot.mjs",
     "start": "electron-vite preview",
     "dist": "electron-vite build && electron-builder",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
-    "typecheck": "npm run typecheck:node && npm run typecheck:web"
+    "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "audit:dependencies": "node scripts/audit-dependencies.mjs",
+    "guidance:vendor": "node scripts/vendor-game-guidance.mjs",
+    "test": "tsc -p tsconfig.test.json && node --test .test-dist/tests/godot-wire.test.js .test-dist/tests/godot-input-codec.test.js .test-dist/tests/credential-vault.test.js",
+    "build:orchestrator": "node scripts/build-orchestrator.mjs",
+    "production:vendor": "node scripts/vendor-production.mjs",
+    "production:execution": "uv run --python 3.12.14 --no-project scripts/vendor-execution.py",
+    "test:production": "tsc -p tsconfig.test.json && node --test .test-dist/tests/production-contracts.test.js .test-dist/tests/production-output.test.js .test-dist/tests/production-planning-context.test.js .test-dist/tests/production-preflight.test.js .test-dist/tests/production-role-config.test.js .test-dist/tests/skill-context.test.js tests/production-policy.test.mjs tests/production-guidance.test.mjs tests/libgodot-lifecycle.test.mjs && node tests/production-framework.integration.mjs",
+    "test:assets": "tsc -p tsconfig.test.json && node --test .test-dist/tests/asset-presets.test.js .test-dist/tests/asset-library.test.js .test-dist/tests/production-role-config.test.js tests/production-policy.test.mjs",
+    "test:execution": "node tests/production-execution.integration.mjs",
+    "test:gateway": "node scripts/check-embedded-gateway.mjs",
+    "test:workflow-adapters": "node scripts/check-production-workflow.mjs",
+    "test:package": "node scripts/check-packaged-production.mjs",
+    "test:studio-ui": "node scripts/check-studio-ui.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.11",
@@ -30,7 +44,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.3.0",
-    "electron-builder": "^25.1.8",
+    "electron-builder": "^26.16.1",
     "electron-vite": "^3.1.0",
     "node-gyp": "^11.5.0",
     "react": "^18.3.1",
@@ -39,8 +53,8 @@
     "vite": "^6.1.0"
   },
   "build": {
-    "appId": "ai.genieengine.desktop",
-    "productName": "GenieEngine",
+    "appId": "ai.solar.desktop",
+    "productName": "Solar",
     "directories": {
       "output": "dist"
     },
@@ -62,7 +76,10 @@
       "!node_modules/devtools-protocol/**",
       "out/**",
       "native/layerhost/build/Release/*.node",
-      "resources/**"
+      "resources/**",
+      "!orchestrator/**",
+      "!tests/**",
+      "!.github/**"
     ],
     "asarUnpack": [
       "node_modules/dugite/**",
@@ -72,6 +89,7 @@
       "resources/**"
     ],
     "mac": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "identity": null,
       "target": [
         "dmg",
@@ -89,6 +107,7 @@
       ]
     },
     "win": {
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}",
       "target": [
         "nsis"
       ],
@@ -104,10 +123,19 @@
         {
           "from": "vendor/koffi/win32",
           "to": "koffi"
+        },
+        {
+          "to": "vendor/orchestrator/win-x64",
+          "from": "vendor/orchestrator/win-x64"
+        },
+        {
+          "to": "vendor/execution/win-x64",
+          "from": "vendor/execution/win-x64"
         }
       ]
     },
     "linux": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "target": [
         "AppImage"
       ],

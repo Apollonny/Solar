@@ -1,6 +1,60 @@
 # Changelog
 
-All notable changes to GenieEngine are documented here.
+All notable changes to Solar (formerly GenieEngine) are documented here.
+
+## [Unreleased]
+
+### Added
+- A shared 14-source partner asset library with secure ZIP/RAR ingestion, mechanism/dimension/style recommendations and exact file hashes; optional automatic AI selection preserves existing project content
+- Immutable Godot sprite/model/effect/animation/audio/shader presets with measured frame/bounds checks, scoped dependency import and creator provenance
+- An opt-in Windows Microsoft Agent Framework production workflow with a self-contained .NET sidecar, actual SDK checkpoints, scoped OpenCode roles, bounded retries/repairs and critical revision-bound approval
+- Separate pinned BMAD/TEA planning and QA skills; an authenticated embedded Godot AI gateway; isolated GdUnit4 discovery/execution; original evidence storage and a mechanically constrained quality gate
+- Production status, Stop/resume, approval scope and evidence links in Chat; documented preview limits and pending live feature acceptance
+- The same 189 game-development guides and six Solar modules are registered as native OpenCode skills, with immutable app-owned SKILL.md snapshots, startup discovery checks and allowlisted skill-load metrics
+- Offline `game_guidance` MCP search/read access to 189 pinned Godot Game Dev Studio guides, their text examples and six Solar instruction modules, with provenance, bounded paging and integrity checks
+- LibGodot's 2D/3D scene editor is created as a native child window inside Solar, so Windows carries it with the app without a separate popup tracking loop
+- NVIDIA API support with its own provider option, encrypted per-slot API keys, NVIDIA NIM endpoint, and model catalog suggestions
+- Solar visual identity across the welcome screen, workspace colors, source artwork, app icon, and new Godot project icons
+- One-time migration of existing settings, encrypted credentials, window preferences, and project history to the Solar identity
+- GitHub Actions now typechecks, runs the unit suite, builds the app, and audits dependencies on macOS, Windows, and Linux
+- A release workflow packages Windows, Linux, Apple Silicon macOS, and Intel macOS installers as downloadable workflow artifacts
+- API keys entered in Solar are stored with operating-system encryption; Settings can move selected legacy OpenCode API keys out of the shared plaintext auth file and restore an encrypted snapshot
+
+### Fixed
+- Planner methodology searches now match individual path keywords and return exact read examples; empty unused tool fields are normalized, rejected paths explain the correct namespace, and per-stage loop guards stop repeated failures/retrieval without treating them as network reconnects
+- Provider credentials are bound to their API family and canonical endpoint across Settings, catalog checks and executor startup; new-key auth checks, cancellable bounded catalog retries, encrypted recovery backups and coordinated rollback prevent stale-key activation and partial settings saves
+- Settings now reject malformed key/URL inputs, discard stale catalog responses after key/provider/endpoint changes, prevent duplicate saves and mid-task connection changes, and preserve the model-default reasoning selection
+- Task-derived dimension/style/asset policies now constrain role routing, relevant skill retrieval and AI asset searches; per-session recommendation receipts, exact resource references and unused-import checks prevent unapproved library application
+- API/server interruptions now show Reconnecting with bounded automatic recovery, saved-session reconciliation and safe Microsoft checkpoint resume; Stop cancels recovery and uncertain writes are not replayed
+- Game Studio now checks project preparation, editor connection and configured models, shows real stage activity and offers visible Stop/resume/recovery actions
+- Production roles submit native StructuredOutput artifacts with bounded host schema validation; exact assistant tool-message reads work around OpenCode 1.17.13's bulk structured-format encoder error
+- Planner sessions receive a small revision-bound project excerpt and a native tool allowlist, leaving asset selection and implementation to the Developer
+- Mode changes cannot interrupt a running assistant turn; failed sends preserve the draft and attachments for retry
+- Verified feature completion includes a chat result and labeled criterion/evidence links; provider failures never become feature completion
+- LibGodot editor closure waits for actual worker thread/FFI teardown before releasing the host window or quitting Electron
+- Production asset checks verify actual sprite framing and observable gameplay state; a whole-sheet image or an omitted private counter cannot substitute for feature evidence
+- Feature workflows verify configured credentials, selected catalog entries and image-input capability before development; unknown key quota never implies a positive account balance
+- Role-specific step/time bounds and compact BMAD/TEA indexes prevent small stories from exhausting a generic 12-step limit; limit summaries block with a readable error
+- Vision reviews avoid duplicated scene trees and use a smaller ordinary output budget while preserving explicit reasoning budgets and complete original evidence
+- Microsoft role permissions use one ordered ruleset so deprecated OpenCode tool settings cannot hide allowed reference/asset tools; disconnected or denied tool access blocks before provider generation
+- Microsoft stage prompts retain only assigned native skill descriptions, avoiding a full catalog in every provider request while keeping all pinned guides installed
+- Imported Nojoule shaders preserve their 5×5 texture samples while avoiding Godot 4.7's unsupported built-in sampler argument path
+- Godot seed import settings no longer mark new resources as failed imports; owned compatibility overlays can upgrade after complete hash verification while modified addons remain protected
+- Legitimate early Windows geometry messages are forwarded during native editor creation without changing child parenting, dragging or cursor behavior
+- Controlled roles no longer request automatic chat titles; output budgets preserve explicit reasoning budgets, and incomplete/reasoning-only provider replies block acceptance with numeric attempt diagnostics
+- Original runtime evidence is saved before vision review; Microsoft retries a transient vision request against the same intact capture without replaying the runtime or input
+- TEA must read its original structured evidence; scoped native external-directory reads support both OpenCode wildcard forms while the exact file allowlist remains enforced
+- Godot gateway startup failures identify their upstream error code without exposing capability tokens
+- Godot Editor startup now stops the active preview, removes stale Solar test-agent files safely, detects immediate editor crashes, saves a launch log, and offers recovery mode; later crashes are reported in the Files panel
+- Temporary Godot overrides are cleaned synchronously on app exit, and cleanup preserves user-authored override and agent files
+- Opening a project no longer requires an AI API key; the editor opens immediately and the assistant shows an inline setup action only when its selected model is unavailable
+- Asset generation rejects symbolic-link paths for reference images and output directories, and replaces existing asset files atomically so their symlink targets are never overwritten
+
+### Changed
+- The English AI core is below 6 KB; detailed art, memory, architecture and validation guidance loads on demand through the existing primary model
+- The project workbench now gives the game preview a persistent status toolbar, opens the assistant at a more readable width, and uses a clearer prompt-first empty state; the sidebar divider also supports keyboard resizing
+- electron-builder is updated to 26.16.1
+- macOS release packaging requires the native embedded-game host to compile successfully
 
 ## [0.1.1] - 2026-07-10
 

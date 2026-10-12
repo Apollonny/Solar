@@ -1,39 +1,67 @@
 <p align="center">
-  <img src="docs/logo.png" alt="GenieEngine" width="440">
+  <img src="docs/logo.png" alt="Solar orbital mark" width="128">
 </p>
+
+<h1 align="center">Solar</h1>
+<p align="center">CREATE WORLDS WITH AI</p>
+
+Solar's assistant can optionally choose compatible partner assets, import only the
+needed files, and instantiate Godot presets. Browse **Files → Asset library** or
+describe the feature in chat. See [asset library integration](docs/asset-library.md).
 
 <p align="center">
   <a href="https://discord.gg/BC8fF2nr4y"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue?style=for-the-badge" alt="License: GPLv3"></a>
 </p>
 
-**GenieEngine** is an AI-powered game engine that lets you build commercial-quality video game with AI. Games are real [Godot 4](https://godotengine.org) projects under the hood, and
+**Solar** is an AI-powered game engine that lets you build video games with AI. Games are real [Godot 4](https://godotengine.org) projects under the hood, and
 the AI assistant is powered by the [OpenCode](https://opencode.ai) CLI. Everything — the engine,
 git, and the AI agent — ships inside the app, so there's nothing to install or configure beyond
 an API key.
 
-![GenieEngine running a game built with it, chat on the right, embedded game view on the left](docs/screenshot.png)
-*GenieEngine is capable of creating commercial-grade games. [Play demo here](https://legojazz.itch.io/survival-fortress).*
+![An earlier version running a game with chat and an embedded game view](docs/screenshot.png)
+*Earlier app screenshot. [Play the demo](https://legojazz.itch.io/survival-fortress).*
+
+## Game development guidance
+
+The assistant uses the bundled Godot Game Dev Studio library (189 skills) and
+six Solar modules through OpenCode's native `skill` tool. Full instructions load
+when a skill is selected; `game_guidance` helps find skills and read supporting
+examples. The library is pinned, available offline, and adapted through Solar's ECS rules.
+See [guidance usage and limits](docs/game-guidance.md) and
+[upstream attribution/licenses](resources/game-guidance/README.md).
+
+## Production workflow preview (Windows)
+
+An optional Microsoft Agent Framework sidecar coordinates BMAD planning,
+task-scoped native skills, controlled OpenCode roles, Godot AI execution,
+GdUnit4 tests and an evidence-based TEA gate. It is disabled by default while
+complete model-driven acceptance is pending. See [setup, ownership, recovery,
+locks and acceptance status](docs/production-workflow.md).
 
 ## Free and Open Source
 
-GenieEngine is completely free and open source under the permissive GPLv3 license. No strings
-attached, no royalties. Games you create are yours. We follow the very permissive Open Source model
-of Godot, which is a key technology that enables GenieEngine.
+Solar is free and open source under the GPLv3-or-later license. Games you create are yours.
+Godot is a key open-source technology that makes Solar possible.
 
-## Quick Install
+## Build installers
 
-| Platform | Download |
-| --- | --- |
-| macOS (Apple Silicon & Intel) | [OpenGenie.dmg](https://github.com/GenieEngine/GenieEngine/releases/download/v0.1.2/GenieEngine-0.1.2-arm64.dmg) |
-| Windows | [OpenGenie-Setup.exe](https://github.com/GenieEngine/GenieEngine/releases/download/v0.1.2/GenieEngine.Setup.0.1.2.exe) |  Note: I don't have a Windows machine, so this is untested
-| Linux | [OpenGenie.AppImage](https://github.com/GenieEngine/GenieEngine/releases/download/v0.1.2/GenieEngine-0.1.2.AppImage) |  Note: I don't have a Linux machine, so this is untested
+With Node.js 22 and npm installed, run `npm ci` to install dependencies and stage the bundled
+Godot and OpenCode binaries. Run `npm run dev` for development or `npm run dist` to package the
+current platform. The **Release builds** GitHub Actions workflow packages Windows, Linux, Apple
+Silicon macOS, and Intel macOS installers when a `v*` tag is pushed; it can also be started
+manually. Workflow artifacts are kept for 30 days and are not published as GitHub Releases.
 
-## Why GenieEngine (vs. a coding agent like Claude Code)
+Windows builds of the production preview also need its locked offline bundles:
+run `npm run build:orchestrator` with .NET SDK 10.0.401 and
+`npm run production:execution` with uv. See the [maintainer instructions](docs/production-workflow.md).
+These tools are build prerequisites; packaged app users do not need to install them.
+
+## Why Solar (vs. a coding agent like Claude Code)
 
 Claude Code and OpenCode are excellent general-purpose coding agents — but they assume you already
 have a dev environment, are comfortable in a terminal, can easily create art assets, and can wire
-up a game engine and an export process yourself. GenieEngine uses that same class of AI agent, but
+up a game engine and an export process yourself. Solar uses that same class of AI agent, but
 packages it for one job: making a game.
 
 - **The AI tests its own work** — through a built-in MCP harness, the assistant can run the game
@@ -49,31 +77,39 @@ packages it for one job: making a game.
   yourself (MacOS, Linux, Windows, iOS, Android, Web).
 
 Claude Code is the right tool if you're a developer who wants an agent inside your existing
-workflow. GenieEngine is for anyone who wants to make a game, with the same caliber of AI doing the
+workflow. Solar is for anyone who wants to make a game, with the same caliber of AI doing the
 work end-to-end.
 
 ## Getting started
 
 ### 1. Install and create a project
 
-Install GenieEngine and open it. From the welcome screen, click **New Game**.
+Build and open Solar. From the welcome screen, click **Create a game**.
 
 ### 2. Connect your AI assistant
 
-On first launch, GenieEngine shows a **Connect your AI assistant** screen (reopen it any time via
-the gear icon in the title bar). It has three tabs:
+Open **Connect your AI assistant** through the gear icon to configure AI generation.
+Creating projects, opening the Godot editor and Run work without an API key. Settings has three tabs:
 
-**Models** — required; the model slots that power the assistant. Each slot takes any
-OpenAI-compatible **API endpoint** (defaults to **OpenRouter**, `https://openrouter.ai/api/v1`), a
-**Model**, an **API key**, and **Thinking** / **Reasoning effort** settings. Grab a key from
-[openrouter.ai/keys](https://openrouter.ai/keys) and paste it into the Medium slot — the Large and
-Image slots reuse it if you leave theirs blank. Recommended setup:
+**Models** — required for AI generation; each slot chooses an API provider, base URL, model ID, and API key. The
+native providers are **OpenAI**, **Anthropic**, **Google Gemini**, **xAI**, and **NVIDIA**. **OpenRouter** is the
+default, and **Custom (OpenAI-compatible)** supports compatible gateways. NVIDIA uses NVIDIA API keys and NVIDIA NIM
+model IDs. The single **Chat model** and separate **Image model**
+can use different providers. Use **Check & load** to verify the connection and fetch that
+provider's model catalog as type-ahead suggestions; the model field still accepts a custom ID. The
+Image slot reports whether the provider confirms image input for the selected model. Leave a slot's
+key blank to copy a key from another slot when both use the same provider and base URL. For
+OpenRouter, get a key from [openrouter.ai/keys](https://openrouter.ai/keys). For NVIDIA, create
+an API key in [NVIDIA Build](https://build.nvidia.com/) and choose **NVIDIA** in the provider list.
+| Slot | Role |
+| --- | --- |
+| **Chat model** | Plans and prepares game changes; also executes the assigned planning and TEA roles in Microsoft mode |
+| **Image model** | Reads reference images and original gameplay screenshots; must accept image input |
 
-| Slot | What it does | Recommended model | Thinking | Reasoning effort |
-| --- | --- | --- | --- | --- |
-| **Chat model — Medium** | The everyday model that plans and writes your game's code | `deepseek/deepseek-v4-flash` | Enabled | Max |
-| **Chat model — Large** | A heavyweight model for tough tasks — switch to it from the dropdown in the chat box | `deepseek/deepseek-v4-pro` | Enabled | Max |
-| **Image model** | Reads images you attach and play-tests your game with screenshots — must accept image input | `moonshotai/kimi-k2.7-code` | Enabled | Max |
+Reasoning controls use the selected model's supported effort/budget contract.
+The prompt composer exposes its available effort levels; a model without confirmed
+reasoning support does not receive invented levels. Medium/Large identifiers remain
+readable internally for migration of older saved settings.
 
 **Asset generation** *(optional)* — two more tabs let the assistant create art straight into your
 project's assets folder:
@@ -85,6 +121,15 @@ project's assets folder:
 
 Skipping a tab just disables that capability; the assistant will explain what it can't do rather
 than failing silently.
+
+**Credential storage** — API keys entered in Solar Settings are encrypted with the operating
+system's secure storage and passed to Solar's OpenCode process at runtime. On Linux, saving
+keys requires GNOME Keyring or KWallet; Solar won't fall back to an insecure plaintext store.
+Keys already saved by OpenCode in its shared `auth.json` stay there until you choose **Move legacy
+OpenCode credentials** in Settings. Select only the provider keys you want to move: Solar
+encrypts those keys in its own vault, removes just those entries from the shared file, and keeps an
+encrypted backup. Settings can restore that file while it still matches the version created by the
+migration.
 
 ### 3. Build your game
 

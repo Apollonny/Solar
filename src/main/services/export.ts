@@ -1,7 +1,8 @@
 import { shell } from 'electron'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createWriteStream, existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
@@ -50,7 +51,7 @@ const PLATFORMS: PlatformSpec[] = [
     presetName: 'macOS',
     platform: 'macOS',
     outFile: (n) => `${n}.zip`,
-    extraOptions: (slug) => `application/bundle_identifier="ai.genieengine.${slug}"\n`
+    extraOptions: (slug) => `application/bundle_identifier="ai.solar.${slug}"\n`
   },
   {
     id: 'linux',
@@ -78,13 +79,14 @@ const PLATFORMS: PlatformSpec[] = [
     presetName: 'iOS',
     platform: 'iOS',
     outFile: (n) => `${n}.ipa`,
-    extraOptions: (slug) => `application/bundle_identifier="ai.genieengine.${slug}"\n`
+    extraOptions: (slug) => `application/bundle_identifier="ai.solar.${slug}"\n`
   }
 ]
 
 let exporting = false
 let currentChild: ChildProcess | null = null
 let cancelRequested = false
+let exportAbort: AbortController | null = null
 
 function progress(update: ExportProgress): void {
   sendToRenderer('export:progress', update)
@@ -128,44 +130,58 @@ export async function extractZip(archive: string, dest: string): Promise<void> {
 }
 
 /** Download + install the full template set (once per Godot version). */
-async function ensureTemplates(): Promise<void> {
+async function ensureTemplates(signal: AbortSignal): Promise<void> {
   const dir = templatesDir()
   if (existsSync(dir) && (await readdir(dir)).length > 10) return
 
   progress({ phase: 'templates', message: 'Downloading Godot export templates (~1 GB, one-time)…', percent: 0 })
-  const archive = join(tmpdir(), `og-templates-${GODOT_VERSION}.tpz`)
-  const res = await fetch(TEMPLATES_URL, { redirect: 'follow' })
-  if (!res.ok || !res.body) throw new Error(`Template download failed: HTTP ${res.status}`)
-  const total = Number(res.headers.get('content-length') ?? 0)
-  let received = 0
-  let lastPercent = -1
-  const counter = new (await import('node:stream')).Transform({
-    transform(chunk, _enc, cb) {
-      received += chunk.length
-      const percent = total ? Math.floor((received / total) * 100) : 0
-      if (percent !== lastPercent) {
-        lastPercent = percent
-        progress({ phase: 'templates', message: 'Downloading Godot export templates…', percent })
+  const archive = join(tmpdir(), `solar-templates-${GODOT_VERSION}-${randomUUID()}.tpz`)
+  let extractTo: string | null = null
+  const backup = `${dir}.${randomUUID()}.backup`
+  let backedUp = false
+  try {
+    const res = await fetch(TEMPLATES_URL, { redirect: 'follow', signal })
+    if (!res.ok || !res.body) throw new Error(`Template download failed: HTTP ${res.status}`)
+    const total = Number(res.headers.get('content-length') ?? 0)
+    let received = 0
+    let lastPercent = -1
+    const counter = new (await import('node:stream')).Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length
+        const percent = total ? Math.floor((received / total) * 100) : 0
+        if (percent !== lastPercent) {
+          lastPercent = percent
+          progress({ phase: 'templates', message: 'Downloading Godot export templates…', percent })
+        }
+        cb(null, chunk)
       }
-      cb(null, chunk)
-    }
-  })
-  await pipeline(Readable.fromWeb(res.body as never), counter, createWriteStream(archive))
-  if (cancelRequested) {
-    await rm(archive, { force: true })
-    throw new Error('Export cancelled.')
-  }
+    })
+    await pipeline(Readable.fromWeb(res.body as never), counter, createWriteStream(archive), { signal })
+    signal.throwIfAborted()
 
-  progress({ phase: 'templates', message: 'Installing export templates…', percent: 100 })
-  const extractTo = join(tmpdir(), `og-templates-extract-${Date.now()}`)
-  await mkdir(extractTo, { recursive: true })
-  // A .tpz is a zip with everything under templates/.
-  await extractZip(archive, extractTo)
-  await mkdir(join(dir, '..'), { recursive: true })
-  await rm(dir, { recursive: true, force: true })
-  await rename(join(extractTo, 'templates'), dir)
-  await rm(archive, { force: true })
-  await rm(extractTo, { recursive: true, force: true })
+    progress({ phase: 'templates', message: 'Installing export templates…', percent: 100 })
+    await mkdir(join(dir, '..'), { recursive: true })
+    // Extract beside the destination so installation also works across volumes.
+    extractTo = await mkdtemp(join(dir, '..', '.solar-templates-'))
+    // A .tpz is a zip with everything under templates/.
+    await extractZip(archive, extractTo)
+    signal.throwIfAborted()
+    if ((await readdir(join(extractTo, 'templates'))).length <= 10) throw new Error('The downloaded template archive is incomplete.')
+    if (existsSync(dir)) {
+      await rename(dir, backup)
+      backedUp = true
+    }
+    try {
+      await rename(join(extractTo, 'templates'), dir)
+    } catch (error) {
+      if (backedUp) { await rename(backup, dir); backedUp = false }
+      throw error
+    }
+    if (backedUp) await rm(backup, { recursive: true, force: true })
+  } finally {
+    await rm(archive, { force: true }).catch(() => {})
+    if (extractTo) await rm(extractTo, { recursive: true, force: true }).catch(() => {})
+  }
 }
 
 /**
@@ -176,7 +192,13 @@ async function ensureTemplates(): Promise<void> {
 async function ensureEtc2Astc(projectPath: string): Promise<void> {
   const file = join(projectPath, 'project.godot')
   let src = await readFile(file, 'utf8')
-  if (src.includes('import_etc2_astc')) return
+  const setting = /^textures\/vram_compression\/import_etc2_astc\s*=.*$/m
+  if (setting.test(src)) {
+    if (/^textures\/vram_compression\/import_etc2_astc\s*=\s*true\s*$/m.test(src)) return
+    src = src.replace(setting, 'textures/vram_compression/import_etc2_astc=true')
+    await writeFile(file, src)
+    return
+  }
   if (/^\[rendering\]$/m.test(src)) {
     src = src.replace(/^\[rendering\]$/m, '[rendering]\n\ntextures/vram_compression/import_etc2_astc=true')
   } else {
@@ -271,7 +293,7 @@ function mergePresets(existing: string, specs: PlatformSpec[], slug: string): st
   if (existing !== '' && missing.length === 0) return null
 
   const blocks = [...kept.map((p) => p.body), ...missing.map((s) => presetBlock(s, slug))]
-  let out = '; Export presets — GenieEngine appends missing presets here; existing ones (including\n; presets configured in the Godot editor) are preserved as-is.\n'
+  let out = '; Export presets — Solar appends missing presets here; existing ones (including\n; presets configured in the Godot editor) are preserved as-is.\n'
   blocks.forEach((body, i) => {
     const renumbered = body.replace(/^\[preset\.\d+(\.options)?\]/gm, (_m, opt: string | undefined) => `[preset.${i}${opt ?? ''}]`)
     out += '\n' + renumbered.trimEnd() + '\n'
@@ -284,7 +306,8 @@ async function ensurePresets(projectPath: string, specs: PlatformSpec[], slug: s
   let existing = ''
   try {
     existing = await readFile(file, 'utf8')
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
     // First export for this project — no presets yet.
   }
   const merged = mergePresets(existing, specs, slug)
@@ -293,21 +316,28 @@ async function ensurePresets(projectPath: string, specs: PlatformSpec[], slug: s
 
 export async function runExport(projectPath: string, baseName: string, platformIds: ExportPlatform[]): Promise<void> {
   if (exporting) throw new Error('An export is already in progress.')
-  const godot = await resolveGodot()
-  if (!godot) throw new Error('The bundled Godot engine is missing.')
-
-  const specs = PLATFORMS.filter((p) => platformIds.includes(p.id))
-  if (specs.length === 0) throw new Error('Select at least one platform.')
-  const name = baseName.trim().replace(/[\\/:*?"<>|]/g, '').trim() || 'game'
-  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'game'
-
+  // Claim the operation before binary resolution yields to a second IPC call.
   exporting = true
   cancelRequested = false
+  const controller = new AbortController()
+  exportAbort = controller
   try {
-    await ensureTemplates()
+    const godot = await resolveGodot()
+    if (!godot) throw new Error('The bundled Godot engine is missing.')
 
-    await ensureEtc2Astc(projectPath)
+    const specs = PLATFORMS.filter((p) => platformIds.includes(p.id))
+    if (specs.length === 0) throw new Error('Select at least one platform.')
+    const name = baseName.trim().replace(/[\\/:*?"<>|]/g, '').trim() || 'game'
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'game'
+
+    controller.signal.throwIfAborted()
+    await ensureTemplates(controller.signal)
+    controller.signal.throwIfAborted()
+
+    if (specs.some((spec) => ['macos', 'android', 'ios'].includes(spec.id))) await ensureEtc2Astc(projectPath)
+    controller.signal.throwIfAborted()
     await ensureNoBootSplash(projectPath)
+    controller.signal.throwIfAborted()
     await ensurePresets(projectPath, specs, slug)
 
     for (const spec of specs) {
@@ -316,6 +346,7 @@ export async function runExport(projectPath: string, baseName: string, platformI
 
       const outDir = join(projectPath, 'exports', spec.id)
       await mkdir(outDir, { recursive: true })
+      controller.signal.throwIfAborted()
       const outPath = join(outDir, spec.outFile(name))
 
       const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
@@ -331,9 +362,10 @@ export async function runExport(projectPath: string, baseName: string, platformI
         child.stdout?.on('data', (c: string) => (output += c))
         child.stderr?.on('data', (c: string) => (output += c))
         child.once('error', reject)
-        child.once('exit', (code) => resolve({ code, output }))
+        child.once('close', (code) => resolve({ code, output }))
       })
       currentChild = null
+      controller.signal.throwIfAborted()
 
       const produced = existsSync(outPath)
       if (result.code === 0 && produced) {
@@ -354,16 +386,19 @@ export async function runExport(projectPath: string, baseName: string, platformI
     }
     progress({ phase: 'done' })
   } catch (err) {
-    progress({ phase: 'done', message: err instanceof Error ? err.message : String(err) })
-    throw err
+    const error = cancelRequested ? new Error('Export cancelled.') : err
+    progress({ phase: 'done', message: error instanceof Error ? error.message : String(error) })
+    throw error
   } finally {
     exporting = false
     currentChild = null
+    exportAbort = null
   }
 }
 
 export function cancelExport(): void {
   cancelRequested = true
+  exportAbort?.abort()
   currentChild?.kill()
 }
 

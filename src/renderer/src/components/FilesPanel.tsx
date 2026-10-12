@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { FileEntry, ProjectInfo } from '../../../shared/types'
+import { AssetLibrary } from './AssetLibrary'
 import {
   ChevronIcon,
   CollapseAllIcon,
@@ -14,6 +15,8 @@ import {
 interface Props {
   project: ProjectInfo
   refreshToken: number
+  onLocateGodot: () => Promise<void>
+  onUseAsset: (request: string) => void
 }
 
 /**
@@ -22,11 +25,22 @@ interface Props {
  * by absolute path; refresh re-lists every open directory in place so the
  * tree does not collapse when the AI changes files.
  */
-export function FilesPanel({ project, refreshToken }: Props): React.JSX.Element {
+export function FilesPanel({ project, refreshToken, onLocateGodot, onUseAsset }: Props): React.JSX.Element {
+  const [view, setView] = useState<'project'|'library'>('project')
   const [dirs, setDirs] = useState<Record<string, FileEntry[]>>({})
   const [openDirs, setOpenDirs] = useState<Set<string>>(new Set())
   const [selected, setSelected] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [openingGodot, setOpeningGodot] = useState(false)
+  const [recoveryAvailable, setRecoveryAvailable] = useState(false)
+
+  useEffect(() => window.api.onGodotEditorFailure((failure) => {
+    if (failure.projectPath.toLowerCase() !== project.path.toLowerCase()) return
+    setNotice(null)
+    setError(failure.message)
+    setRecoveryAvailable(!failure.recoveryMode)
+  }), [project.path])
 
   const load = useCallback(async (path: string): Promise<void> => {
     const result = await window.api.listDir(path)
@@ -75,11 +89,29 @@ export function FilesPanel({ project, refreshToken }: Props): React.JSX.Element 
     })
   }
 
-  const openExternal = async (kind: 'vscode' | 'godot', target?: string): Promise<void> => {
+  const openExternal = async (kind: 'vscode' | 'godot', target?: string, recoveryMode = false): Promise<void> => {
     setError(null)
-    const result =
-      kind === 'vscode' ? await window.api.openInVSCode(target) : await window.api.openInGodotEditor()
-    if (!result.ok) setError(result.error)
+    setNotice(null)
+    setRecoveryAvailable(false)
+    if (kind === 'godot') setOpeningGodot(true)
+    try {
+      const result =
+        kind === 'vscode' ? await window.api.openInVSCode(target) : await window.api.openInGodotEditor(recoveryMode)
+      if (!result.ok) {
+        setError(result.error)
+        setRecoveryAvailable(kind === 'godot' && !recoveryMode && result.error.startsWith('Godot Editor closed'))
+      } else if (kind === 'godot') {
+        setNotice(
+          result.data
+            ? recoveryMode ? 'Godot Editor started in recovery mode.' : 'Godot Editor started for this project.'
+            : 'Godot Editor is already open or handed off to another window.'
+        )
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (kind === 'godot') setOpeningGodot(false)
+    }
   }
 
   const renderEntries = (parent: string, depth: number): React.JSX.Element[] => {
@@ -126,6 +158,8 @@ export function FilesPanel({ project, refreshToken }: Props): React.JSX.Element 
 
   return (
     <div className="files-panel">
+      <div className="asset-library-nav" role="group" aria-label="File tools"><button className={view==='project'?'active':''} aria-pressed={view==='project'} onClick={()=>setView('project')}>Project files</button><button className={view==='library'?'active':''} aria-pressed={view==='library'} onClick={()=>setView('library')}>Asset library</button></div>
+    {view==='library'?<AssetLibrary projectPath={project.path} onUseAsset={onUseAsset}/>:<>
       <div className="panel-header">
         <span className="panel-title-caps" title={project.path}>
           {project.name}
@@ -144,14 +178,33 @@ export function FilesPanel({ project, refreshToken }: Props): React.JSX.Element 
         <button className="open-btn" onClick={() => void openExternal('vscode')}>
           <VSCodeLogoIcon size={14} /> VS Code
         </button>
-        <button className="open-btn" onClick={() => void openExternal('godot')}>
-          <GodotLogoIcon size={14} /> Godot Editor
+        <button className="open-btn" disabled={openingGodot} title="Open Godot Editor (stops a running game preview)" onClick={() => void openExternal('godot')}>
+          <GodotLogoIcon size={14} /> {openingGodot ? 'Opening Godot…' : 'Godot Editor'}
         </button>
       </div>
 
-      {error && <div className="error-banner small">{error}</div>}
+      {error && (
+        <div className="error-banner small">
+          {error}
+          {recoveryAvailable && (
+            <button className="btn btn-sm btn-ghost" disabled={openingGodot}
+              title="Starts Godot without editor plugins and tool scripts"
+              onClick={() => void openExternal('godot', undefined, true)}>
+              Open in recovery mode
+            </button>
+          )}
+          {(error.toLowerCase().includes('bundled godot engine is missing') ||
+            error.toLowerCase().includes('could not start godot editor')) && (
+            <button className="btn btn-sm btn-ghost" onClick={() => void onLocateGodot()}>
+              Locate Godot…
+            </button>
+          )}
+        </div>
+      )}
+      {notice && <div className="setup-hint">{notice}</div>}
 
       <div className="tree">{renderEntries(project.path, 0)}</div>
+      </>}
     </div>
   )
 }

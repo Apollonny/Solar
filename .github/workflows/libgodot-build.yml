@@ -1,0 +1,35 @@
+name: Build LibGodot editor library
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install SCons
+        run: python -m pip install 'scons>=4.4,<5'
+      - name: Build pinned Godot editor DLL and child-window executable
+        run: node scripts/build-libgodot.mjs
+      - name: Upload native editors and revision manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: solar-libgodot-4.7.1-windows-x64
+          path: |
+            vendor/godot/win32/libgodot.dll
+            vendor/godot/win32/libgodot-manifest.json
+            vendor/godot/win32/solar-godot.exe
+            vendor/godot/win32/solar-godot-manifest.json
+          if-no-files-found: error
+          retention-days: 14

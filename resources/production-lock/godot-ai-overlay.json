@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "description": "Solar compatibility overlay: unsaved state, original framebuffers, authenticated bounded library byte import and compact import logs. Upstream bundle stays immutable.",
+  "patches": [
+    {
+      "path": "plugin.gd",
+      "before": "\tvar server_command := ClientConfigurator.get_server_command(lookup_trace)",
+      "after": "\t# Solar starts an offline authenticated backend; never install via uvx.\n\tvar server_command: Array[String] = []"
+    },
+    {
+      "path": "handlers/editor_handler.gd",
+      "before": "\t\t\"project_name\": ProjectSettings.get_setting(\"application/config/name\", \"\"),",
+      "after": "\t\t\"project_name\": ProjectSettings.get_setting(\"application/config/name\", \"\"),\n\t\t\"solar_unsaved_scenes\": Array(EditorInterface.get_unsaved_scenes()),\n\t\t\"solar_unsaved_scripts\": Array(EditorInterface.get_script_editor().get_unsaved_files()),\n\t\t\"solar_filesystem_scanning\": EditorInterface.get_resource_filesystem().is_scanning(),\n\t\t\"solar_compatibility\": 1,"
+    },
+    {
+      "path": "handlers/editor_handler.gd",
+      "before": "\t_vision_routing = vision_routing",
+      "after": "\t# Solar owns vision review; preserve raw framebuffer evidence.\n\t_vision_routing = null"
+    },
+    {
+      "path": "handlers/filesystem_handler.gd",
+      "before": "func write_file(params: Dictionary) -> Dictionary:\n\tvar path: String = params.get(\"path\", \"\")\n\tvar content: String = params.get(\"content\", \"\")",
+      "after": "\nfunc _solar_import_asset_bytes(path: String, content: String) -> Dictionary:\n\t# Only Solar's host adapter creates this chunk envelope. Model ChangeSets\n\t# reject its prefix before reaching the authenticated execution gateway.\n\tif not path.begins_with(\"res://assets/library/\"):\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Asset writes require the library namespace\")\n\tvar spec: Variant = JSON.parse_string(content.substr(21))\n\tif not spec is Dictionary:\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Invalid asset chunk\")\n\tvar sha: String = str(spec.get(\"sha256\", \"\"))\n\tvar total := int(spec.get(\"total\", -1))\n\tvar offset := int(spec.get(\"offset\", -1))\n\tvar encoded: String = str(spec.get(\"data\", \"\"))\n\tif sha.length() != 64 or not sha.is_valid_hex_number(false) or total < 0 or total > 67108864 or offset < 0 or encoded.length() > 524288:\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Asset chunk bounds are invalid\")\n\tif FileAccess.file_exists(path):\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"An existing asset will not be overwritten\")\n\tvar chunk := Marshalls.base64_to_raw(encoded)\n\tif chunk.size() + offset > total:\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Asset chunk exceeds its declared size\")\n\tvar staging := \"res://.solar/asset-import/\" + sha + \".part\"\n\tDirAccess.make_dir_recursive_absolute(staging.get_base_dir())\n\tif offset == 0 and FileAccess.file_exists(staging):\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"An interrupted asset import needs inspection\")\n\tif offset > 0:\n\t\tvar previous := FileAccess.open(staging, FileAccess.READ)\n\t\tif previous == null:\n\t\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Missing asset chunk sequence\")\n\t\tvar previous_size := previous.get_length()\n\t\tprevious.close()\n\t\tif previous_size != offset:\n\t\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Asset chunk sequence does not match\")\n\tvar file := FileAccess.open(staging, FileAccess.WRITE if offset == 0 else FileAccess.READ_WRITE)\n\tif file == null:\n\t\treturn ErrorCodes.make(ErrorCodes.INTERNAL_ERROR, \"Cannot create asset staging file\")\n\tfile.seek(offset)\n\tfile.store_buffer(chunk)\n\tfile.flush()\n\tvar status := file.get_error()\n\tfile.close()\n\tif status != OK:\n\t\treturn ErrorCodes.make(ErrorCodes.INTERNAL_ERROR, \"Asset chunk was not written\")\n\tif not bool(spec.get(\"finish\", false)):\n\t\treturn {\"data\": {\"path\": path, \"committed\": false, \"bytes\": offset + chunk.size()}}\n\tif offset + chunk.size() != total or FileAccess.get_sha256(staging) != sha:\n\t\treturn ErrorCodes.make(ErrorCodes.INVALID_PARAMS, \"Asset hash/size verification failed\")\n\tDirAccess.make_dir_recursive_absolute(path.get_base_dir())\n\tif FileAccess.file_exists(path) or DirAccess.rename_absolute(staging, path) != OK:\n\t\treturn ErrorCodes.make(ErrorCodes.INTERNAL_ERROR, \"Asset destination changed\")\n\t# Solar scans once after the complete asset batch.\n\treturn {\"data\": {\"path\": path, \"committed\": true, \"sha256\": sha, \"bytes\": total}}\n\nfunc write_file(params: Dictionary) -> Dictionary:\n\tvar path: String = params.get(\"path\", \"\")\n\tvar content: String = params.get(\"content\", \"\")\n\tif content.begins_with(\"SOLAR_ASSET_BYTES_V1:\"):\n\t\tvar safety = McpPathValidator.path_error(path, \"path\", true)\n\t\tif safety != null:\n\t\t\treturn safety\n\t\treturn _solar_import_asset_bytes(path, content)"
+    },
+    {
+      "path": "dispatcher.gd",
+      "before": "\t\t_log_buffer.log(\"[recv] %s(%s)\" % [command, JSON.stringify(raw_params)])",
+      "after": "\t\tvar logged_params: Dictionary = raw_params.duplicate()\n\t\tif str(logged_params.get(\"content\", \"\")).begins_with(\"SOLAR_ASSET_BYTES_V1:\"):\n\t\t\tlogged_params[\"content\"] = \"[Solar library byte chunk; hash and offset recorded in workflow journal]\"\n\t\t_log_buffer.log(\"[recv] %s(%s)\" % [command, JSON.stringify(logged_params)])"
+    }
+  ]
+}
